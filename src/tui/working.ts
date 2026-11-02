@@ -57,16 +57,17 @@ export class SessionWorking {
   }
 
   update(slot: SessionSlot, active: boolean): void {
+    const coordination = slot.waitingOperations?.values().next().value;
     const waiting = slot.state === 'waiting';
     const busy = waiting || !!slot.task || !slot.runtime.session.isIdle || slot.state === 'running';
     const ordinary = !slot.activity || slot.activity.kind === 'working';
-    if (!active || !busy || (ordinary && (!this.visible || this.options?.frames?.length === 0))) {
+    if (!active || !busy || (!coordination && ordinary && (!this.visible || this.options?.frames?.length === 0))) {
       this.pause();
       return;
     }
     const elapsed = slot.metrics?.current ? ` · ${formatDuration(slot.metrics.elapsedMs())}`
       : slot.shell ? ` · ${formatDuration(Date.now() - slot.shell.startedAt)}` : '';
-    const message = waiting ? `Waiting for input${elapsed} (Esc to cancel)`
+    const message = coordination ? `${coordination}${elapsed}` : waiting ? `Waiting for input${elapsed} (Esc to cancel)`
       : `${ordinary ? this.message ?? 'Working' : slot.activity!.message}${elapsed} (Esc to interrupt)`;
     if (this.loader && waiting !== this.staticIndicator) this.pause();
     if (!this.loader) {

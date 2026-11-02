@@ -105,7 +105,8 @@ setTimeout(() => process.exit(2), 20000).unref();
     await assert.rejects(pool.close(a.id), /运行/);
 
     await pool.submit(b.id, '/execute');
-    await assert.rejects(pool.submit(b.id, 'conflicting write'), /正在此目录执行/);
+    await pool.submit(b.id, 'same directory execute discussion');
+    assert.equal(a.state, 'running', 'another execute-mode task must not stop the running shell');
     await pool.submit(b.id, '/discuss');
     assert.ok(a.runtime.session.getActiveToolNames().includes(shell));
 

@@ -80,7 +80,9 @@ TUI 内置命令：/login、/model、/new、/resume、/settings、/quit
 消息展示：Ctrl+T 折叠／展开思考；/thinking-display [collapse|expand|hide]；Ctrl+O 或 /tools 展开、收起工具
 任务队列：运行中 Enter 追加指令；Windows Ctrl+Q 排队后续消息、Alt+Q 取回（其他系统 Alt+Enter、Alt+Up）
 会话工具：/compact [摘要要求] 手动压缩；/copy 或 Ctrl+X 复制回答；/editor 或 Ctrl+G 外部编辑草稿
-本项目命令：/discuss 只读讨论；/execute 允许执行；/project 查看项目；/changes 查看 Git 变更
+本项目命令：/discuss 只读讨论；/execute 允许执行；/project 查看项目
+文件变更：/changes 查看本轮快照和彩色 diff；面板可预览撤销／重做；/changes git 查看 Git 变更
+文件恢复：/undo 撤销最近一轮；/redo 重做；均先预览，Enter 确认，Esc 取消；/recovery 恢复未完成操作的备份
 新会话默认讨论模式；恢复会话时沿用上次模式。切换模式不会自动开始任务。
 未发送提问的页面只是临时草稿，不计入历史；新建时复用无草稿的空白页。
 `;

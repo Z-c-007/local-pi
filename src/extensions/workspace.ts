@@ -1,7 +1,14 @@
-import type { ExtensionContext, ExtensionFactory } from '@earendil-works/pi-coding-agent';
+import type { ExtensionContext, ExtensionFactory, ToolCallEvent, ToolResultEvent } from '@earendil-works/pi-coding-agent';
 import { mcpTools, modeEntryType, modeInstruction, modeLabel, readTools, restoreMode, toolsForMode, type WorkMode } from '../agent/mode.ts';
 
-export const createWorkspaceExtension = (initialMode: WorkMode): ExtensionFactory => (pi) => {
+export interface WorkspaceHooks {
+  beforeRun(): Promise<string | void>;
+  beforeTool(event: ToolCallEvent): Promise<void>;
+  afterTool(event: ToolResultEvent): Promise<void>;
+  executeTool?<T>(event: { toolName: string; toolCallId: string; input: Record<string, unknown>; signal?: AbortSignal }, execute: () => Promise<T>): Promise<T>;
+  beforeWrite?(absolutePath: string): Promise<void>;
+}
+export const createWorkspaceExtension = (initialMode: WorkMode, hooks?: WorkspaceHooks): ExtensionFactory => (pi) => {
   let mode = initialMode;
   const executionMcpTools = new Set<string>();
   const activeTools = () => {
@@ -50,7 +57,8 @@ export const createWorkspaceExtension = (initialMode: WorkMode): ExtensionFactor
     handler: async (_args, ctx) => switchMode('execute', ctx),
   });
 
-  pi.on('before_agent_start', (event, ctx) => {
+  pi.on('before_agent_start', async (event, ctx) => {
+    const workspaceNotice = await hooks?.beforeRun();
     apply(ctx);
     const instruction = modeInstruction(mode);
     // Structured sections are persisted and updated with Pi's normal prompt protocol.
@@ -59,14 +67,16 @@ export const createWorkspaceExtension = (initialMode: WorkMode): ExtensionFactor
     // Also give the model a fresh state notice after the user's input. This repairs
     // old conversations that contain an assistant's incorrect "still in discuss" claim.
     return { message: {
-      customType: 'local-pi-mode-context', content: instruction, display: false, details: { mode },
+      customType: 'local-pi-mode-context', content: instruction + (workspaceNotice ? `\n[工作目录变更通知] ${workspaceNotice}` : ''), display: false, details: { mode },
     } };
   });
-  pi.on('tool_call', (event) => {
+  pi.on('tool_call', async (event) => {
     if (mode === 'discuss' && !readTools.includes(event.toolName)) {
       return { block: true, reason: '讨论模式仅允许读取和搜索。请用户手动切换 /execute 后再执行修改或命令。', terminate: true };
     }
+    await hooks?.beforeTool(event);
   });
+  pi.on('tool_result', async (event) => { await hooks?.afterTool(event); });
 
   pi.registerCommand('project', {
     description: '显示当前工作目录、模型和工具',

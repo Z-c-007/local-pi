@@ -15,6 +15,13 @@ type McpConfigModule = typeof import('../../node_modules/@earendil-works/pi-codi
 type McpOAuthModule = typeof import('../../node_modules/@earendil-works/pi-coding-agent/dist/extensions/mcp/oauth.js');
 type AuthModule = typeof import('../../node_modules/@earendil-works/pi-coding-agent/dist/core/auth-storage.js');
 type PowerShellModule = typeof import('../../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/powershell.js');
+type DiffModule = typeof import('../../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/edit-diff.js');
+type PathsModule = typeof import('../../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/path-utils.js');
+
+export async function loadPiDiff(): Promise<DiffModule> {
+  return officialModule()('core/tools/edit-diff.js');
+}
+export async function loadPiPaths(): Promise<PathsModule> { return officialModule()('core/tools/path-utils.js'); }
 export type PiUi = Omit<ThemeModule, 'theme'> & ControllerModule & FooterModule & CommandsModule & ClipboardModule & ClipboardImageModule & HttpModule & ExternalEditorModule & {
   getTheme(): ThemeModule['theme'];
 };

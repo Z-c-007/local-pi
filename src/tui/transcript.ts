@@ -8,6 +8,8 @@ import {
 } from '@earendil-works/pi-tui';
 import type { SessionSlot, ToolEvent } from '../agent/session-pool.ts';
 import { readTaskReports, formatTaskReport } from '../agent/task-metrics.ts';
+import { changeSummary, type FileChangeReport } from '../agent/file-changes.ts';
+import { displayPath } from './changes-panel.ts';
 
 type Message = SessionSlot['runtime']['session']['messages'][number];
 type AssistantMessage = Extract<Message, { role: 'assistant' }>;
@@ -173,6 +175,7 @@ export class Transcript extends Container {
   private revision = -1;
   private readonly cards = new Map<string, Component>();
   private shellOffset = 0;
+  private readonly onViewChanges?: (id: string) => void;
   applySettings(): void {
     for (const card of this.cards.values()) this.configureCard(card);
     this.revision = -1;
@@ -192,17 +195,34 @@ export class Transcript extends Container {
     // Native Markdown colors read Pi's live theme. Invalidate caches while
     // retaining the native per-block thinking and tool disclosure state.
     for (const [key, card] of this.cards) {
-      if (key.startsWith('report:')) this.cards.delete(key);
+      if (key.startsWith('report:') || key.startsWith('changes:')) this.cards.delete(key);
       else card.invalidate();
     }
     this.revision = -1;
   }
 
-  constructor(slot: SessionSlot, tui: TUI, onInteraction: () => void) {
+  constructor(slot: SessionSlot, tui: TUI, onInteraction: () => void, onViewChanges?: (id: string) => void) {
     super();
     this.slot = slot;
     this.tui = tui;
     this.onInteraction = onInteraction;
+    this.onViewChanges = onViewChanges;
+  }
+
+  private changeCard(report: FileChangeReport): Component {
+    const content = new Container();
+    const status = { running: '未记录结束／状态未知', completed: '已完成', failed: '失败', aborted: '已停止' }[report.status];
+    content.addChild(new Text(getMarkdownTheme().heading(`本轮文件变更 · ${status} · ${changeSummary(report)}`), 1, 0));
+    content.addChild(new Text(report.changes.slice(0, 5).map((file) => `${{ added: '新增', modified: '修改', deleted: '删除', unavailable: '未知' }[file.kind]} ${displayPath(file.path)}${file.added !== undefined ? `  +${file.added} -${file.removed}` : ''}`).join('\n')
+      || (report.issues.length || report.status === 'running' ? '快照不完整，无法确认全部变化。' : '限定范围内没有文件变化。'), 1, 0));
+    const undone = report.changes.filter((file) => file.restoreState === 'undone').length;
+    if (undone) content.addChild(new Text(`已撤销 ${undone}/${report.changes.length} 个文件`, 1, 0));
+    const link = new Text(getMarkdownTheme().link('[查看变更]') + '  /changes · 撤销／重做需预览确认', 1, 0);
+    content.addChild(new MouseRegion(link, (event) => {
+      if (event.type !== 'click' || event.button !== 'left') return undefined;
+      this.onViewChanges?.(report.id); return { handled: true };
+    }));
+    content.addChild(new Spacer(1)); return content;
   }
 
   setThinking(display?: ThinkingDisplay): void {
@@ -243,6 +263,7 @@ export class Transcript extends Container {
     const used = new Set<string>();
     const reports = readTaskReports(this.slot.runtime.session).filter((report) => report.id !== this.slot.metrics?.current?.id);
     const displayedReports = new Set<string>();
+    const changes = this.slot.fileChanges ?? []; const displayedChanges = new Set<string>();
     const currentAssistants = new Set<string>();
     this.clear();
     const add = (key: string, create: () => Component) => {
@@ -289,6 +310,9 @@ export class Transcript extends Container {
         displayedReports.add(report.id);
         add(`report:${report.id}`, () => new Text(getMarkdownTheme().quote(formatTaskReport(report)), 1, 1));
       }
+      for (const report of changes.filter((report) => !displayedChanges.has(report.id) && report.afterTimestamp === message.timestamp)) {
+        displayedChanges.add(report.id); add(`changes:${report.id}:${report.changes.map((file) => file.restoreState ?? '').join(',')}`, () => this.changeCard(report));
+      }
     });
     if (this.slot.shell) {
       const shell = this.slot.shell;
@@ -302,6 +326,7 @@ export class Transcript extends Container {
     for (const report of reports.filter((report) => !displayedReports.has(report.id))) {
       add(`report:${report.id}`, () => new Text(getMarkdownTheme().quote(formatTaskReport(report)), 1, 1));
     }
+    for (const report of changes.filter((report) => !displayedChanges.has(report.id))) add(`changes:${report.id}:${report.changes.map((file) => file.restoreState ?? '').join(',')}`, () => this.changeCard(report));
     // Keep hidden thinking cards, so switching back from hidden restores per-message overrides.
     for (const [key, card] of this.cards) if (!used.has(key) && !currentAssistants.has(key)) {
       if (card instanceof BashExecutionComponent) card.setComplete(undefined, true);

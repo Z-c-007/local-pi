@@ -117,7 +117,11 @@ test('manual shell streams, uses cwd, cancels independently and distinguishes !!
     const b = await pool.open(); pool.activate(a.id);
     terminal.type(process.platform === 'win32' ? '!Write-Output SHELL_STARTED; Start-Sleep -Seconds 20\r' : '!echo SHELL_STARTED; sleep 20\r');
     await until(() => !!a.shell?.output.includes('SHELL_STARTED')); pool.activate(b.id); assert.ok(a.task);
-    await assert.rejects(pool.executeShell(b.id, 'echo SHOULD_NOT_RUN'), /正在此目录执行/);
+    const waiting = pool.executeShell(b.id, 'echo SHOULD_NOT_RUN');
+    const cancelled = assert.rejects(waiting, /取消/);
+    await until(() => !!b.waitingOperations?.size);
+    await pool.abort(b.id); await cancelled;
+    assert.ok(a.task, 'cancelling B workspace wait must preserve A shell');
     pool.activate(a.id); terminal.input?.('\x1b'); await until(() => !a.task);
     assert.ok(a.runtime.session.messages.some((m) => m.role === 'bashExecution' && m.cancelled));
     assert.equal(b.runtime.session.messages.some((m) => m.role === 'bashExecution'), false);

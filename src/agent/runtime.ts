@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { constants } from 'node:fs';
+import { access, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -7,6 +9,7 @@ import {
   createAgentSessionRuntime,
   createAgentSessionServices,
   createMcpExtension,
+  createEditToolDefinition, createWriteToolDefinition, defineTool,
   getAgentDir,
   SessionManager,
   type AgentSession,
@@ -16,7 +19,7 @@ import {
   type SessionStartEvent,
 } from '@earendil-works/pi-coding-agent';
 import type { Options } from '../cli.ts';
-import { createWorkspaceExtension } from '../extensions/workspace.ts';
+import { createWorkspaceExtension, type WorkspaceHooks } from '../extensions/workspace.ts';
 import { codingTools, mcpTools, restoreMode, toolsForMode } from './mode.ts';
 import { loadPiRuntimeSupport } from '../tui/pi-ui.ts';
 
@@ -33,6 +36,7 @@ export function sessionDirectory(cwd: string, sessionsRoot = defaultSessionsRoot
 }
 
 export interface RuntimeOverrides {
+  workspaceHooks?: WorkspaceHooks;
   modelRuntime?: ModelRuntime;
   settingsManager?: SettingsManager;
   sessionsRoot?: string;
@@ -44,7 +48,7 @@ export async function createRuntime(
   options: Options,
   overrides: RuntimeOverrides = {},
 ) {
-  const { sessionsRoot, sessionManager: suppliedManager, sessionStartEvent: initialStartEvent, ...servicesOverrides } = overrides;
+  const { workspaceHooks, sessionsRoot, sessionManager: suppliedManager, sessionStartEvent: initialStartEvent, ...servicesOverrides } = overrides;
   const agentDir = options.agentDir ?? getAgentDir();
   const sessionDir = sessionDirectory(options.cwd, sessionsRoot);
   let sessionManager: SessionManager;
@@ -71,12 +75,26 @@ export async function createRuntime(
   const official = await loadPiRuntimeSupport();
   const create: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager: manager, sessionStartEvent }) => {
     const mode = restoreMode(manager.getBranch());
+    let session: AgentSession | undefined;
+    const wrapped = new WeakSet<object>();
+    const wrap = (name: string) => {
+      const definition = session?.getToolDefinition(name);
+      if (!definition || !workspaceHooks?.executeTool || wrapped.has(definition)) return;
+      const execute = definition.execute;
+      definition.execute = (id, input, signal, update, ctx) => workspaceHooks.executeTool!({ toolName: name, toolCallId: id,
+        input: input as Record<string, unknown>, signal }, () => execute.call(definition, id, input, signal, update, ctx));
+      wrapped.add(definition);
+    };
+    const hooks = workspaceHooks && { ...workspaceHooks, beforeTool: async (event: Parameters<WorkspaceHooks['beforeTool']>[0]) => {
+      // Also covers tools registered lazily by MCP and fresh native definitions after /reload.
+      wrap(event.toolName); await workspaceHooks.beforeTool(event);
+    } };
     const services = await createAgentSessionServices({
       cwd,
       agentDir,
       ...servicesOverrides,
       resourceLoaderOptions: {
-        extensionFactories: [createWorkspaceExtension(mode), ...official.builtInExtensions.map((extension) =>
+        extensionFactories: [createWorkspaceExtension(mode, hooks), ...official.builtInExtensions.map((extension) =>
           typeof extension === 'function' || extension.name !== 'mcp' ? extension : { ...extension, factory: createMcpExtension({
             loadConfig: (ctx) => official.loadMcpConfig({ agentDir, cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted() }),
             credentials: new official.McpOAuthCredentialStore(new official.FileAuthStorageBackend(join(agentDir, 'mcp-auth.json')), agentDir),
@@ -102,7 +120,17 @@ export async function createRuntime(
       thinkingLevel: manager.getBranch().some((entry) => entry.type === 'thinking_level_change')
         ? manager.buildSessionContext().thinkingLevel as AgentSession['thinkingLevel'] : undefined,
       tools: [...codingTools, ...mcpTools, 'mcp__*'],
+      customTools: workspaceHooks?.executeTool ? [
+        defineTool(createEditToolDefinition(cwd, { operations: { readFile: (path) => readFile(path),
+          access: (path) => access(path, constants.R_OK | constants.W_OK),
+          writeFile: async (path, content) => { await workspaceHooks.beforeWrite?.(path); await writeFile(path, content, 'utf8'); } } })),
+        defineTool(createWriteToolDefinition(cwd, { operations: {
+          mkdir: async (path) => { await mkdir(path, { recursive: true }); },
+          writeFile: async (path, content) => { await workspaceHooks.beforeWrite?.(path); await writeFile(path, content, 'utf8'); } } })),
+      ] : undefined,
     });
+    session = result.session;
+    for (const tool of session.getAllTools()) wrap(tool.name);
     // Keep coding tools registered for switching, but expose only the current mode's tools.
     result.session.setActiveToolsByName(toolsForMode(mode));
     return { ...result, services, diagnostics: services.diagnostics };

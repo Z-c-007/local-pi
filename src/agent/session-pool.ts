@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
-import { existsSync, realpathSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { AgentSessionEvent, ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
@@ -10,11 +11,16 @@ import { createRuntime, type RuntimeOverrides } from './runtime.ts';
 import { SessionCatalog, sameProject, type SavedSession } from './session-catalog.ts';
 import { TaskMetrics } from './task-metrics.ts';
 import { loadPiRuntimeSupport } from '../tui/pi-ui.ts';
+import { FileChanges, within, snapshotExcludes, type Capture, type FileChangeReport } from './file-changes.ts';
+import { overlaps, WorkspaceCoordinator } from './workspace-coordinator.ts';
+import { OperationStore } from './operation-store.ts';
+import { WorkspaceOperations } from './workspace-operations.ts';
+import { FileRestore, type RestoreDirection, type RestorePlan, type RestoreJournal } from './file-restore.ts';
 
 export type Runtime = Awaited<ReturnType<typeof createRuntime>>;
 export type ToolEvent = Extract<AgentSessionEvent, { type: 'tool_execution_start' | 'tool_execution_update' | 'tool_execution_end' }>;
 export interface SessionActivity {
-  kind: 'working' | 'retry' | 'compaction' | 'branchSummary' | 'shell' | 'reload';
+  kind: 'working' | 'retry' | 'compaction' | 'branchSummary' | 'shell' | 'reload' | 'capture';
   message: string;
 }
 export interface SessionSlot {
@@ -34,9 +40,16 @@ export interface SessionSlot {
   error?: string;
   revision: number;
   metrics: TaskMetrics;
+  fileChanges: FileChangeReport[];
+  capture?: Capture;
+  captureFinishing?: boolean;
+  coordinationAbort?: AbortController;
+  waitingOperations?: Map<string, string>;
+  workspaceChanged?: string;
+  seenRestoration?: number;
   compactionQueue: Array<{ text: string; mode: 'steer' | 'followUp' }>;
   stopping?: boolean;
-  operation?: 'shell' | 'reload' | 'tree';
+  operation?: 'shell' | 'reload' | 'tree' | 'restore';
   shell?: { command: string; output: string; excludeFromContext: boolean; startedAt: number };
   unsubscribe: () => void;
 }
@@ -56,12 +69,22 @@ export class SessionPool extends EventEmitter {
   readonly options: Options;
   private readonly factory: RuntimeFactory;
   readonly catalog: SessionCatalog;
+  readonly fileChanges: FileChanges;
+  readonly coordinator: WorkspaceCoordinator;
+  readonly restore: FileRestore;
+  readonly operations: OperationStore;
+  private readonly workspaceOperations: WorkspaceOperations;
 
   constructor(options: Options, factory: RuntimeFactory = createRuntime, sessionsRoot?: string) {
     super();
     this.options = options;
     this.factory = factory;
     this.catalog = new SessionCatalog(sessionsRoot);
+    this.coordinator = new WorkspaceCoordinator(this.catalog.root);
+    this.fileChanges = new FileChanges(this.catalog.root, this.coordinator);
+    this.restore = new FileRestore(this.fileChanges, this.coordinator);
+    this.operations = new OperationStore(this.catalog.root);
+    this.workspaceOperations = new WorkspaceOperations(this.operations, this.coordinator);
   }
 
   get active(): SessionSlot {
@@ -168,10 +191,29 @@ export class SessionPool extends EventEmitter {
     }
     // The catalog has already resolved --continue; never fall back to a hidden
     // SDK-only empty transcript when no formal conversation was found.
+    let boundSlot: SessionSlot | undefined;
     const runtime = await this.factory({ ...options, model: saved?.fork ? undefined : options.model, continue: false }, {
       sessionsRoot: this.catalog.root,
       sessionManager: saved ? this.catalog.restore(saved) : undefined,
       sessionStartEvent,
+      workspaceHooks: {
+        beforeRun: async () => {
+          if (boundSlot) {
+            await this.operations.reconcile(this.coordinator);
+            const latest = await this.coordinator.latestRestore(boundSlot.runtime.cwd);
+            const message = boundSlot.workspaceChanged ?? (latest && latest.seq > (boundSlot.seenRestoration ?? 0)
+              ? `共享目录发生过文件恢复（版本 ${latest.seq}）。先重新读取相关文件，历史工具结果可能已过期。` : undefined);
+            boundSlot.seenRestoration = latest?.seq; boundSlot.workspaceChanged = undefined; return message;
+          }
+        },
+        beforeTool: async () => {},
+        afterTool: async () => {},
+        executeTool: (event, execute) => {
+          if (!boundSlot) throw new Error('会话尚未初始化，不能执行工具。');
+          return this.runTool(boundSlot, event, execute);
+        },
+        beforeWrite: (path) => this.workspaceOperations.beforeWrite(path),
+      },
     });
     if (this.disposing) { await runtime.dispose(); throw new Error('程序正在退出。'); }
     let snapshot: SavedSession;
@@ -188,8 +230,12 @@ export class SessionPool extends EventEmitter {
     const slot: SessionSlot = {
       id: runtime.session.sessionId, number: ++this.serial, runtime, state: 'idle', unread: false,
       saved: snapshot,
-      notices: [], statuses: new Map(), runningTools: new Set(), toolEvents: new Map(), revision: 0, metrics: new TaskMetrics(), compactionQueue: [], unsubscribe: () => {},
+      notices: [], statuses: new Map(), runningTools: new Set(), toolEvents: new Map(), revision: 0, metrics: new TaskMetrics(),
+      fileChanges: this.fileChanges.read(runtime.session), compactionQueue: [], unsubscribe: () => {},
     };
+    boundSlot = slot;
+    try { await this.restore.annotate(slot.fileChanges); }
+    catch (error) { await runtime.dispose(); throw error; }
     slot.unsubscribe = runtime.session.subscribe((event) => this.onEvent(slot, event));
     this.slots.set(slot.id, slot);
     const oldActive = this.activeId;
@@ -212,6 +258,8 @@ export class SessionPool extends EventEmitter {
         onError: (error) => this.notify(slot, `扩展错误：${error.error}`),
       });
       for (const diagnostic of runtime.diagnostics) this.notify(slot, diagnostic.message);
+      await this.operations.reconcile(this.coordinator);
+      if ((await this.coordinator.pendingFor(runtime.cwd)).length) this.notify(slot, '此目录存在未完成或未确认的文件操作；使用 /recovery 查看备份和操作日志。');
       this.changed(slot);
       return slot;
     } catch (error) {
@@ -237,6 +285,8 @@ export class SessionPool extends EventEmitter {
   }
 
   private onEvent(slot: SessionSlot, event: AgentSessionEvent): void {
+    // A stop can arrive during SDK input/auth preflight, before its agent owns a signal.
+    if (event.type === 'agent_start' && slot.stopping) slot.runtime.session.agent.abort();
     if (event.type === 'agent_start') slot.metrics.begin(slot.runtime.session);
     if (event.type === 'agent_start' || event.type === 'turn_start') {
       slot.activity = { kind: 'working', message: 'Working' };
@@ -278,7 +328,15 @@ export class SessionPool extends EventEmitter {
       }
       if (slot.id !== this.activeId) slot.unread = true;
     }
-    if (event.type === 'tool_execution_start') slot.runningTools.add(event.toolName);
+    if (event.type === 'tool_execution_start') {
+      slot.runningTools.add(event.toolName);
+      if (slot.capture && ['edit', 'write'].includes(event.toolName) && typeof event.args?.path === 'string') {
+        const path = resolve(slot.runtime.cwd, event.args.path);
+        if (!within(slot.runtime.cwd, path) || event.args.path.split(/[\\/]/).some((part: string) => snapshotExcludes.includes(part.toLowerCase()))) {
+          slot.capture.report.issues.push(`工具目标不在快照范围内：${event.args.path}`);
+        }
+      }
+    }
     if (event.type === 'tool_execution_end') slot.runningTools.delete(event.toolName);
     if (event.type === 'tool_execution_start' || event.type === 'tool_execution_update' || event.type === 'tool_execution_end') {
       slot.toolEvents.set(event.toolCallId, event);
@@ -286,8 +344,8 @@ export class SessionPool extends EventEmitter {
     if (event.type === 'agent_settled') {
       slot.metrics.finish(slot.runtime.session, event.aborted ? 'aborted' : slot.error ? 'failed' : 'completed');
       slot.activity = undefined;
-      slot.state = slot.error ? 'error' : 'idle';
-      if (slot.id !== this.activeId) {
+      slot.state = slot.task ? 'running' : slot.error ? 'error' : 'idle';
+      if (slot.id !== this.activeId && !slot.task) {
         slot.unread = true;
         this.emit('background-finished', slot);
       }
@@ -300,6 +358,7 @@ export class SessionPool extends EventEmitter {
     if (!slot || this.disposing) throw new Error('会话已关闭。');
     if (slot.stopping) throw new Error('会话正在停止，请稍后再发送。');
     if (slot.operation) throw new Error('当前会话正在执行终端命令、重载或会话树操作；请等待完成，草稿会保留。');
+    if (slot.captureFinishing) throw new Error('正在保存本轮文件变化，请稍后发送；草稿会保留。');
     const name = text.startsWith('/') ? text.slice(1).split(/\s/, 1)[0]! : '';
     if (name && slot.runtime.session.extensionRunner?.getCommand(name)) {
       try { await slot.runtime.session.prompt(text); }
@@ -324,19 +383,20 @@ export class SessionPool extends EventEmitter {
       this.changed(slot);
       return;
     }
-    if (restoreMode(slot.runtime.session.sessionManager.getBranch()) === 'execute') {
-      const workspace = realpathSync(slot.runtime.cwd);
-      const conflict = [...this.slots.values()].find((other) => other !== slot && other.task
-        && sameProject(realpathSync(other.runtime.cwd), workspace)
-        && (other.operation === 'shell' || restoreMode(other.runtime.session.sessionManager.getBranch()) === 'execute'));
-      if (conflict) throw new Error(`会话 ${conflict.number} 正在此目录执行。请等待、停止它，或在独立 worktree 中执行；讨论模式仍可使用。`);
-    }
     slot.error = undefined;
+    slot.coordinationAbort = new AbortController();
     this.save(slot, text);
     slot.state = 'running';
     slot.activity = { kind: 'working', message: 'Working' };
     slot.metrics.begin(slot.runtime.session);
-    const task = slot.runtime.session.prompt(text);
+    const task = Promise.resolve().then(async () => {
+      try {
+        if (restoreMode(slot.runtime.session.sessionManager.getBranch()) === 'execute') await this.beginCapture(slot, text, 'task');
+        if (!slot.stopping) await slot.runtime.session.prompt(text);
+      }
+      catch (error) { slot.error = error instanceof Error ? error.message : String(error); throw error; }
+      finally { await this.finishCapture(slot); }
+    });
     slot.task = task;
     this.changed(slot);
     try { await task; }
@@ -346,12 +406,14 @@ export class SessionPool extends EventEmitter {
     } finally {
       slot.metrics.finish(slot.runtime.session, slot.error ? 'failed' : 'completed');
       slot.task = undefined;
+      slot.coordinationAbort = undefined;
       slot.activity = undefined;
       slot.streaming = undefined;
       slot.runningTools.clear();
       slot.state = slot.error ? 'error' : 'idle';
       this.save(slot);
       this.changed(slot);
+      if (slot.id !== this.activeId) { slot.unread = true; this.emit('background-finished', slot); }
     }
     if (!slot.error) await this.drainCompactionQueue(slot);
   }
@@ -411,14 +473,16 @@ export class SessionPool extends EventEmitter {
       throw new Error('请先等待当前任务完成或 /stop；此操作不会自动中断任务。');
     }
     slot.operation = operation; slot.state = 'running'; slot.error = undefined;
-    slot.activity = { kind: operation === 'tree' ? 'branchSummary' : operation,
-      message: operation === 'tree' ? 'Navigating session tree' : operation === 'reload' ? 'Reloading resources' : 'Running shell' };
+    slot.coordinationAbort = new AbortController();
+    slot.activity = { kind: operation === 'tree' ? 'branchSummary' : operation === 'restore' ? 'capture' : operation,
+      message: operation === 'tree' ? 'Navigating session tree' : operation === 'reload' ? 'Reloading resources' : operation === 'restore' ? 'Restoring files' : 'Running shell' };
     let result!: T;
     const task = Promise.resolve().then(() => action(slot)).then((value) => { result = value; });
     slot.task = task; this.changed(slot);
     try { await task; return result; }
     finally {
       slot.task = undefined; slot.operation = undefined; slot.shell = undefined; slot.activity = undefined;
+      slot.coordinationAbort = undefined;
       slot.state = 'idle'; this.save(slot); this.changed(slot);
     }
   }
@@ -426,6 +490,7 @@ export class SessionPool extends EventEmitter {
   async navigateTree(id: string, targetId: string, options?: Parameters<Runtime['session']['navigateTree']>[1]) {
     return this.idleOperation(id, 'tree', async (slot) => {
       const result = await slot.runtime.session.navigateTree(targetId, options);
+      await this.refreshChanges(slot);
       slot.toolEvents.clear(); slot.streaming = undefined;
       return result;
     });
@@ -441,38 +506,137 @@ export class SessionPool extends EventEmitter {
   async executeShell(id: string, command: string, excludeFromContext = false): Promise<void> {
     if (!command.trim()) throw new Error('请在 ! 后输入终端命令。');
     await this.idleOperation(id, 'shell', async (slot) => {
-      const conflict = [...this.slots.values()].find((other) => other !== slot && other.task
-        && sameProject(other.runtime.cwd, slot.runtime.cwd)
-        && (other.operation === 'shell' || restoreMode(other.runtime.session.sessionManager.getBranch()) === 'execute'));
-      if (conflict) throw new Error(`会话 ${conflict.number} 正在此目录执行；请等待、停止它或使用独立 worktree。`);
-      const session = slot.runtime.session;
-      slot.shell = { command, output: '', excludeFromContext, startedAt: Date.now() }; this.changed(slot);
-      const intercepted = await session.extensionRunner.emitUserBash({ type: 'user_bash', command, cwd: slot.runtime.cwd, excludeFromContext });
-      if (slot.stopping) return;
-      if (intercepted?.result) {
-        session.recordBashResult(command, intercepted.result, { excludeFromContext });
-      } else {
-        const official = await loadPiRuntimeSupport();
-        if (slot.stopping) return;
-        await session.executeBash(command, (chunk) => {
-          if (slot.shell) slot.shell.output += chunk;
-          this.changed(slot);
-        }, { excludeFromContext, operations: intercepted?.operations
-          ?? (process.platform === 'win32' ? official.createLocalPowerShellOperations() : undefined) });
-      }
-      this.notify(slot, '终端命令已结束；不会自动请求模型。');
+      try {
+        await this.beginCapture(slot, `! ${command}`, 'shell');
+        await this.runTool(slot, { toolName: 'user_shell', toolCallId: randomUUID(), input: { command } }, async () => {
+          const session = slot.runtime.session;
+          slot.shell = { command, output: '', excludeFromContext, startedAt: Date.now() }; this.changed(slot);
+          const intercepted = await session.extensionRunner.emitUserBash({ type: 'user_bash', command, cwd: slot.runtime.cwd, excludeFromContext });
+          if (slot.stopping) return;
+          let result = intercepted?.result;
+          if (result) {
+            session.recordBashResult(command, result, { excludeFromContext });
+          } else {
+            const official = await loadPiRuntimeSupport();
+            if (slot.stopping) return;
+            result = await session.executeBash(command, (chunk) => {
+              if (slot.shell) slot.shell.output += chunk;
+              this.changed(slot);
+            }, { excludeFromContext, operations: intercepted?.operations
+              ?? (process.platform === 'win32' ? official.createLocalPowerShellOperations() : undefined) });
+          }
+          this.notify(slot, '终端命令已结束；不会自动请求模型。');
+          return result;
+        });
+      } catch (error) { slot.error = error instanceof Error ? error.message : String(error); throw error; }
+      finally { await this.finishCapture(slot); }
     });
+  }
+
+  private async beginCapture(slot: SessionSlot, title: string, source: FileChangeReport['source']): Promise<void> {
+    slot.activity = { kind: 'capture', message: 'Recording initial file snapshot' }; this.changed(slot);
+    try { slot.capture = await this.fileChanges.begin(slot.runtime.session, slot.runtime.services.agentDir, title, source, true); }
+    catch (error) {
+      slot.fileChanges = this.fileChanges.read(slot.runtime.session);
+      this.notify(slot, `本轮文件快照未完整建立：${String(error)}；后续任务继续，不能保证记录全部变化。`);
+    }
+    slot.activity = { kind: source === 'shell' ? 'shell' : 'working', message: source === 'shell' ? 'Running shell' : 'Working' };
+    this.changed(slot);
+  }
+
+  private runTool<T>(slot: SessionSlot, event: { toolName: string; toolCallId: string; input: Record<string, unknown>; signal?: AbortSignal }, execute: () => Promise<T>): Promise<T> {
+    const signals = [event.signal, slot.coordinationAbort?.signal].filter((signal): signal is AbortSignal => !!signal);
+    return this.workspaceOperations.run({ ...event, cwd: slot.runtime.cwd, sessionId: slot.id, capture: slot.capture,
+      signal: signals.length ? AbortSignal.any(signals) : undefined,
+      onWait: (owner, target) => {
+        slot.waitingOperations ??= new Map();
+        const old = slot.waitingOperations.get(event.toolCallId);
+        const other = owner && this.slots.get(owner);
+        const message = owner ? `等待${['read', 'edit', 'write'].includes(event.toolName) ? '文件' : '工作区'}（占用者：${other ? `会话 ${other.number}` : owner.slice(0, 8)}） · ${target?.replace(/[\x00-\x1f\x7f]/g, '�')} · Esc 取消本会话等待` : undefined;
+        if (message) slot.waitingOperations.set(event.toolCallId, message); else slot.waitingOperations.delete(event.toolCallId);
+        if (old !== message) this.changed(slot);
+      },
+    }, execute);
+  }
+
+  private async finishCapture(slot: SessionSlot): Promise<void> {
+    if (!slot.capture) return;
+    slot.captureFinishing = true;
+    slot.activity = { kind: 'capture', message: 'Recording final file snapshot' }; this.changed(slot);
+    const last = slot.runtime.session.messages.at(-1);
+    const aborted = slot.stopping || last?.role === 'assistant' && last.stopReason === 'aborted'
+      || last?.role === 'bashExecution' && last.cancelled;
+    try {
+      await this.fileChanges.finish(slot.capture, slot.runtime.session, slot.runtime.services.agentDir,
+        aborted ? 'aborted' : slot.error || last?.role === 'bashExecution' && last.exitCode !== 0 ? 'failed' : 'completed');
+    } catch (error) { this.notify(slot, `最终文件快照未完整保存：${String(error)}`); }
+    finally { slot.captureFinishing = false; slot.capture = undefined; await this.refreshChanges(slot); this.changed(slot); }
+  }
+
+  private async refreshChanges(slot: SessionSlot): Promise<void> {
+    slot.fileChanges = this.fileChanges.read(slot.runtime.session); await this.restore.annotate(slot.fileChanges);
+  }
+  private assertRestoreIdle(slot: SessionSlot): void {
+    if (this.disposing || slot.task || slot.operation || slot.stopping || !slot.runtime.session.isIdle || slot.state === 'waiting') throw new Error('请先等待当前会话完成；恢复不会自动停止任务。');
+    const other = [...this.slots.values()].find((item) => item !== slot && overlaps(item.runtime.cwd, slot.runtime.cwd)
+      && (item.task || item.operation || !item.runtime.session.isIdle || item.state === 'waiting'));
+    if (other) throw new Error(`相关目录的会话 ${other.number} 正在运行或等待输入；不会停止它，请稍后恢复。`);
+  }
+  async restorePlan(id: string, reportId: string, direction: RestoreDirection, onlyPath?: string): Promise<RestorePlan> {
+    const slot = this.slots.get(id); if (!slot) throw new Error('会话已关闭。'); this.assertRestoreIdle(slot);
+    await this.operations.reconcile(this.coordinator);
+    this.assertRestoreIdle(slot);
+    const lease = await this.coordinator.acquire(slot.runtime.cwd, 'restore', slot.id);
+    try { return await this.restore.prepare(slot.runtime.session, reportId, direction, onlyPath); }
+    finally { await this.coordinator.release(lease); }
+  }
+  async applyRestore(id: string, plan: RestorePlan): Promise<RestoreJournal> {
+    const slot = this.slots.get(id); if (!slot) throw new Error('会话已关闭。'); this.assertRestoreIdle(slot);
+    if (plan.sessionId !== id) throw new Error('恢复计划属于其他会话。');
+    return this.idleOperation(id, 'restore', async () => {
+      try { await this.operations.reconcile(this.coordinator); const result = await this.restore.apply(slot.runtime.session, plan); await this.restored(slot, result); return result; }
+      finally { await this.refreshChanges(slot); }
+    });
+  }
+  async recoverRestore(id: string, operationId: string): Promise<RestoreJournal> {
+    const slot = this.slots.get(id); if (!slot) throw new Error('会话已关闭。'); this.assertRestoreIdle(slot);
+    return this.idleOperation(id, 'restore', async () => {
+      try { const result = await this.restore.recover(slot.runtime.session, operationId); await this.restored(slot, result); return result; }
+      finally { await this.refreshChanges(slot); }
+    });
+  }
+  private async restored(slot: SessionSlot, operation: RestoreJournal): Promise<void> {
+    const message = `文件恢复已${operation.phase === 'recovered' ? '回到操作前备份' : operation.direction === 'undo' ? '撤销本轮修改' : '重做本轮修改'}：${operation.files.map((file) => file.path).join('、')}。先重新读取这些文件，不要假设先前工具输出仍代表当前内容。`;
+    try { await slot.runtime.session.sendCustomMessage({ customType: 'local-pi-file-restore', content: message, display: true }, { triggerTurn: false }); }
+    catch (error) { this.notify(slot, `文件已恢复，但会话通知保存失败：${String(error)}。日志 ${operation.id}`); }
+    for (const other of this.slots.values()) if (other !== slot && overlaps(other.runtime.cwd, slot.runtime.cwd)) {
+      other.workspaceChanged = message; this.notify(other, '共享工作目录的文件发生了恢复；本会话的聊天、草稿和队列保留，下次任务需重新读取相关文件。');
+    }
+    this.save(slot); this.changed(slot);
   }
 
   async abort(id: string): Promise<void> {
     const slot = this.slots.get(id);
     if (!slot) return;
     slot.stopping = true;
+    slot.coordinationAbort?.abort(new Error('已取消本会话的工具等待。'));
     try {
       slot.runtime.session.abortBash(); slot.runtime.session.abortBranchSummary();
       await slot.runtime.session.abort(); await slot.task?.catch(() => {});
     }
     finally { slot.stopping = false; this.changed(slot); }
+  }
+
+  async acknowledgeOperation(id: string, operationId: string): Promise<void> {
+    const slot = this.slots.get(id); if (!slot) throw new Error('会话已关闭。');
+    this.assertRestoreIdle(slot);
+    await this.idleOperation(id, 'restore', async () => {
+      await this.operations.acknowledge(operationId, slot.runtime.cwd, this.coordinator);
+      for (const other of this.slots.values()) if (overlaps(other.runtime.cwd, slot.runtime.cwd)) {
+        other.workspaceChanged = '未确认操作已经人工检查并保留当前文件；重新读取文件后再修改。';
+        this.notify(other, other.workspaceChanged);
+      }
+    });
   }
 
   async close(id: string, stop = false): Promise<void> {
@@ -494,6 +658,7 @@ export class SessionPool extends EventEmitter {
 
   async dispose(): Promise<void> {
     this.disposing = true;
-    await Promise.all([...this.slots.keys()].map((id) => this.close(id, true)));
+    try { await Promise.all([...this.slots.keys()].map((id) => this.close(id, true))); }
+    finally { this.operations.close(); }
   }
 }

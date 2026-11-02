@@ -11,7 +11,6 @@ import {
 } from '@earendil-works/pi-tui';
 import { modeLabel, restoreMode } from '../agent/mode.ts';
 import { SessionPool, type SessionSlot } from '../agent/session-pool.ts';
-import { sameProject } from '../agent/session-catalog.ts';
 import { parseOptions } from '../cli.ts';
 import { Transcript, thinkingLabels, type ThinkingDisplay } from './transcript.ts';
 import { SessionEditor, SessionWorking } from './working.ts';
@@ -22,6 +21,10 @@ import { settingsPanel } from './settings.ts';
 import { infoPanel } from './info-panel.ts';
 import { readTaskReports, formatTaskReport } from '../agent/task-metrics.ts';
 import { ExtensionPanels } from './extension-panels.ts';
+import { changesPanel, displayPath } from './changes-panel.ts';
+import type { RestoreDirection } from '../agent/file-restore.ts';
+import { sessionSelector } from './session-selector.ts';
+import { fileOperationPanel } from './file-operation-panel.ts';
 
 type ThinkingLevel = SessionSlot['runtime']['session']['thinkingLevel'];
 export type HostServices = Partial<Pick<PiUi, 'copyToClipboard' | 'editInExternalEditor'>>;
@@ -34,7 +37,8 @@ const commands = [
   ['export', '导出 HTML；附 .jsonl 路径则导出当前分支'], ['reload', '重载当前空闲会话的扩展、技能和项目说明'],
   ['mcp', '官方 MCP 服务器管理：认证、重连、启停和工具暴露'],
   ['discuss', '切换只读讨论'], ['execute', '切换执行模式'], ['project', '查看项目和模式'],
-  ['changes', '查看 Git 变更'], ['code-review', '审查代码变更'], ['model', '选择模型'],
+  ['changes', '可视化查看本轮文件变化；/changes git 查看仓库差异'], ['code-review', '审查代码变更'], ['model', '选择模型'],
+  ['undo', '预览并确认撤销最近一轮文件变化'], ['redo', '预览并确认重做最近撤销的文件变化'], ['recovery', '恢复未完成操作的备份'],
   ['login', '配置模型认证'], ['name', '为当前会话命名'], ['settings', '官方完整设置菜单'],
   ['session', '当前会话详情和用量统计'], ['hotkeys', '实际快捷键和当前冲突'],
   ['compact', '手动压缩当前空闲会话，可附摘要要求'], ['copy', '复制最近助手回答'],
@@ -159,7 +163,7 @@ export class MultiSessionTui {
         const current = this.views.get(slot.id);
         if (current) current.scroll.scrollTo(current.scroll.scrollTop, { disableFollow: true });
         this.schedule();
-      });
+      }, (id) => { void this.showChanges(slot, id).catch((error) => this.pool.notify(slot, String(error))); });
       const settings = slot.runtime.services.settingsManager;
       const hideThinking = settings.getProjectSettings().hideThinkingBlock ?? settings.getGlobalSettings().hideThinkingBlock;
       if (hideThinking === false) transcript.setThinking('expanded');
@@ -396,6 +400,62 @@ export class MultiSessionTui {
     return this.showPanel(slot, (close) => infoPanel(content, () => Math.floor(this.terminal.rows * 0.9) - 2, () => this.tui.requestRender(), close));
   }
 
+  private async showChanges(slot: SessionSlot, id?: string): Promise<void> {
+    const reports = slot.fileChanges;
+    if (id && !reports.some((report) => report.id === id)) throw new Error('本轮快照记录已不可用。');
+    let request: { id: string; direction: RestoreDirection; path?: string } | undefined;
+    await this.showPanel(slot, (close) => changesPanel(reports, () => Math.floor(this.terminal.rows * 0.9) - 2,
+      () => this.tui.requestRender(), close, id, (reportId, direction, path) => { request = { id: reportId, direction, path }; close(); }, () => this.piUi!.getTheme()));
+    if (request && this.pool.activeId === slot.id && this.pool.slots.has(slot.id)) await this.restorePreview(slot, request.id, request.direction, request.path);
+  }
+
+  private async confirmFileOperation(slot: SessionSlot, content: string, enabled: boolean): Promise<boolean> {
+    let confirmed = false;
+    await this.showPanel(slot, (close) => {
+      const confirm = () => { if (enabled) { confirmed = true; close(); } };
+      return fileOperationPanel(content, enabled, () => Math.floor(this.terminal.rows * 0.9) - 2,
+        () => this.piUi!.getTheme(), () => this.tui.requestRender(), confirm, close);
+    });
+    return confirmed && this.pool.activeId === slot.id && this.pool.slots.has(slot.id);
+  }
+
+  private async restorePreview(slot: SessionSlot, reportId: string, direction: RestoreDirection, path?: string): Promise<void> {
+    const plan = await this.pool.restorePlan(slot.id, reportId, direction, path);
+    const label = direction === 'undo' ? '撤销' : '重做';
+    const content = `# ${label}预览\n\n目录：${displayPath(plan.cwd)}\n\n仅恢复文件，保留聊天记录。执行前再次核对版本；先备份，出现冲突整次拒绝。\n\n${plan.files.map((file) => `- ${displayPath(file.path)}：${file.target ? file.expected ? '替换为保存的版本' : '恢复文件' : '删除本轮新增文件'}`).join('\n')}\n\n${plan.conflicts.length ? `## 无法执行\n\n${plan.conflicts.map((reason) => `- ${displayPath(reason)}`).join('\n')}` : `共 ${plan.files.length} 个文件。确认后开始${label}。`}`;
+    if (!await this.confirmFileOperation(slot, content, !plan.conflicts.length)) return;
+    const journal = await this.pool.applyRestore(slot.id, plan);
+    this.view(slot).transcript.resetHistory();
+    this.pool.notify(slot, `已${label} ${journal.files.length} 个文件；操作前备份和日志已保留。`);
+  }
+
+  private async recoverFiles(slot: SessionSlot): Promise<void> {
+    await this.pool.operations.reconcile(this.pool.coordinator);
+    const pending = await this.pool.coordinator.pendingFor(slot.runtime.cwd);
+    const journals = (await this.pool.restore.journals()).filter((journal) => pending.some((item) => item.id === journal.id));
+    const uncertain = this.pool.operations.uncertain(slot.runtime.cwd);
+    if (!journals.length && !uncertain.length) { this.pool.notify(slot, pending.length ? '存在缺失／损坏的恢复日志，请保留备份并人工检查。' : '没有未完成的文件恢复操作。'); return; }
+    const id = await this.choose('未完成／未确认的文件操作', [
+      ...journals.map((journal) => ({ value: journal.id, label: `${journal.direction} · ${journal.files.length} 个文件 · ${journal.phase}`, description: `会话 ${journal.sessionId} · ${journal.created}` })),
+      ...uncertain.map((operation) => ({ value: operation.id, label: `待人工检查 · ${operation.tool} · ${operation.path ?? operation.cwd}`, description: `会话 ${operation.sessionId} · ${operation.error ?? ''}` })),
+    ], true);
+    const operation = uncertain.find((item) => item.id === id);
+    if (operation) {
+      const content = `# 确认保留当前文件\n\n操作：${operation.id}\n\n会话：${operation.sessionId}\n\n工具：${displayPath(operation.tool)}\n\n目标：${displayPath(operation.path ?? operation.cwd)}\n\n修改前版本：${operation.before?.hash ?? '不存在／未记录'}\n\n最后核验版本：${operation.after?.hash ?? '结果未确认'}\n\n备份目录：${this.pool.operations.root}/blobs\n\n${operation.error ?? ''}\n\n请先人工检查当前文件和备份。确认表示保留当前文件并解除这项阻塞，不会自动回滚或恢复文件；脚本的远程操作和后台进程需要另行检查。`;
+      if (await this.confirmFileOperation(slot, content, true)) {
+        await this.pool.acknowledgeOperation(slot.id, operation.id);
+        this.pool.notify(slot, '已确认保留当前文件；操作日志和备份保留。其他未确认操作仍需分别处理。');
+      }
+      return;
+    }
+    const journal = journals.find((item) => item.id === id); if (!journal) return;
+    if (journal.sessionId !== slot.id) throw new Error(`请先切换到此操作所属会话：${journal.sessionId}，其他会话不会被代为恢复。`);
+    const content = `# 恢复操作前备份\n\n${journal.id}\n\n将以下文件恢复到这次撤销／重做开始前的状态。发现外部修改会拒绝覆盖；聊天记录保留。\n\n${journal.files.map((file) => `- ${displayPath(file.path)} · ${file.step}`).join('\n')}`;
+    if (!await this.confirmFileOperation(slot, content, true)) return;
+    await this.pool.recoverRestore(slot.id, journal.id); this.view(slot).transcript.resetHistory();
+    this.pool.notify(slot, '已恢复到操作前的文件状态，相关目录可以继续执行任务。');
+  }
+
   private sessionInfo(slot: SessionSlot): string {
     const session = slot.runtime.session; const stats = session.getSessionStats(); const t = stats.tokens;
     const context = stats.contextUsage;
@@ -424,7 +484,7 @@ export class MultiSessionTui {
     for (const [id, other] of this.views) other.working.update(this.pool.slots.get(id) ?? slot, id === slot.id);
     const title = slot.saved.hasConversation ? slot.saved.name || slot.saved.title || `会话 ${slot.number}`
       : slot.saved.name || '新对话（临时）';
-    this.header.setText(`Local Pi · ${title} · ${stateLabels[slot.state]} · ${modeLabel(restoreMode(slot.runtime.session.sessionManager.getBranch()))}\n${slot.runtime.cwd}`);
+    this.header.setText(`Local Pi · ${title} · ${slot.waitingOperations?.size ? '排队中' : stateLabels[slot.state]} · ${modeLabel(restoreMode(slot.runtime.session.sessionManager.getBranch()))}\n${slot.runtime.cwd}`);
     const pending = this.dialogs.get(slot.id)?.[0];
     view.editor.secret = pending?.secret ?? false;
     const queues = [
@@ -437,7 +497,7 @@ export class MultiSessionTui {
       ? `[等待输入] ${pending.title}\n${pending.choices?.map((choice, i) => `${i + 1}. ${choice}`).join('\n') ?? ''}\n直接输入回答，Esc 取消；Ctrl+P 仍可切换会话。`
       : slot.notices.at(-1) ?? '') + queueText);
     const tabs = [...this.pool.slots.values()].filter((s) => s.saved.hasConversation || this.pool.hasDraft?.(s) || s.id === slot.id)
-      .map((s) => `${s.id === slot.id ? '▶' : ''}${s.saved.hasConversation ? s.number : this.pool.hasDraft?.(s) ? '草稿' : '新对话'}:${stateLabels[s.state]}${s.unread ? '●' : ''}`).join('  ');
+      .map((s) => `${s.id === slot.id ? '▶' : ''}${s.saved.hasConversation ? s.number : this.pool.hasDraft?.(s) ? '草稿' : '新对话'}:${s.waitingOperations?.size ? '排队中' : stateLabels[s.state]}${s.unread ? '●' : ''}`).join('  ');
     const binding = (id: Keybinding) => getKeybindings().getKeys(id).join('/') || '未绑定';
     this.footer.setText(`${tabs} · 推理等级:${slot.runtime.session.thinkingLevel}${slot.runningTools.size ? ` · ${[...slot.runningTools].join(', ')}` : ''}\n${binding('local.session.select')} 会话 · ${binding('local.session.new')} 新建 · ${keyText('app.thinking.cycle') || '/thinking'} 等级 · ${binding('app.thinking.toggle')} 思考内容:${thinkingLabels[view.transcript.thinking]} · ${binding('app.tools.expand')} 工具 · ${binding('app.interrupt')} 停止 · /help`);
     if (this.mounted !== slot.id) {
@@ -542,19 +602,14 @@ export class MultiSessionTui {
   }
 
   private async selectSessionList(): Promise<void> {
-    const cwd = this.pool.active.runtime.cwd;
+    const slot = this.pool.active; const cwd = slot.runtime.cwd;
     const sessions = await this.pool.listSessions(cwd);
-    const id = await this.choose('会话列表 · 当前项目历史和已打开会话（切换不会停止后台任务）', sessions.map((entry) => ({
-      value: entry.id,
-      label: entry.hasConversation ? entry.name || entry.title || '会话' : `临时草稿 · ${entry.name || '未发送'}`,
-      description: [
-        entry.live ? `${entry.hasConversation ? entry.live.number : '不计入历史'} · ${stateLabels[entry.live.state]}` : '历史',
-        entry.id === this.pool.activeId ? '当前' : '', entry.live?.unread ? '未读' : '',
-        entry.fork ? `分叉自 ${entry.fork.sourceSessionId.slice(0, 8)}` : '',
-        new Date(entry.modified).toLocaleString('zh-CN', { hour12: false }), entry.id.slice(0, 8),
-        sameProject(entry.cwd, cwd) ? '' : entry.cwd,
-      ].filter(Boolean).join(' · '),
-    })), true);
+    if (this.pool.activeId !== slot.id || !this.pool.slots.has(slot.id)) return;
+    if (!sessions.length) { this.pool.notify(slot, '暂无其他会话；空白页不计入历史。'); return; }
+    let id: string | undefined;
+    await this.showPanel(slot, (close) => sessionSelector(sessions, cwd, slot.id,
+      () => Math.floor(this.terminal.rows * 0.9) - 2, () => this.piUi!.getTheme(), () => this.tui.requestRender(),
+      (selected) => { id = selected; close(); }, close));
     if (id) await this.pool.openSession(id, cwd);
   }
 
@@ -664,7 +719,7 @@ export class MultiSessionTui {
     const [command, ...parts] = text.split(/\s+/);
     const args = parts.join(' ');
     const dialog = this.dialogs.get(slot.id)?.[0];
-    const navigation = ['/tree', '/export', '/reload', '/fork', '/sessions', '/resume', '/switch', '/new', '/stop', '/quit', '/close', '/thinking', '/thinking-display', '/tools', '/theme', '/session', '/hotkeys', '/settings', '/model', '/copy', '/dequeue', '/compact'];
+    const navigation = ['/undo', '/redo', '/recovery', '/changes', '/tree', '/export', '/reload', '/fork', '/sessions', '/resume', '/switch', '/new', '/stop', '/quit', '/close', '/thinking', '/thinking-display', '/tools', '/theme', '/session', '/hotkeys', '/settings', '/model', '/copy', '/dequeue', '/compact'];
     if (dialog && !navigation.includes(command!)) {
       let answer = text;
       if (dialog.choices) {
@@ -676,6 +731,18 @@ export class MultiSessionTui {
       return;
     }
     if (command === '/tree') return this.showTree(slot);
+    if (command === '/undo' || command === '/redo') {
+      if (args) throw new Error('用法：/undo 或 /redo；选择某轮／文件请用 /changes。');
+      const direction = command === '/undo' ? 'undo' : 'redo';
+      const report = slot.fileChanges.findLast((item) => item.changes.some((file) => direction === 'undo' ? file.restoreState !== 'undone' : file.restoreState === 'undone'));
+      if (!report) throw new Error('没有对应的文件变更记录。');
+      return this.restorePreview(slot, report.id, direction);
+    }
+    if (command === '/recovery') return this.recoverFiles(slot);
+    if (command === '/changes' && args !== 'git') {
+      if (args) throw new Error('用法：/changes 或 /changes git');
+      return this.showChanges(slot);
+    }
     if (command === '/export') return this.exportSession(slot, text.slice('/export'.length));
     if (command === '/reload') return this.reloadSession(slot);
     if (text.startsWith('!')) return this.pool.executeShell(slot.id, text.slice(text.startsWith('!!') ? 2 : 1).trim(), text.startsWith('!!'));
