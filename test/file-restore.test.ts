@@ -147,7 +147,7 @@ test('partial multi-file failure keeps durable backups, blocks tasks and recover
   } finally { await pool.dispose(); }
 });
 
-test('recovery refuses a post-failure external edit; links and untracked changes remain view-only', async () => {
+test('recovery refuses a post-failure external edit; links stay protected while recorded shell changes can undo', async () => {
   const { pool, a, cwd } = await fixture();
   try {
     const report = await tools(pool, a, [edit(), write('new.txt', 'new file')]);
@@ -165,7 +165,9 @@ test('recovery refuses a post-failure external edit; links and untracked changes
     assert.match((await f.pool.restorePlan(f.a.id, report.id, 'undo')).conflicts.join(), /链接数/);
     const shell = process.platform === 'win32' ? "Set-Content -LiteralPath shell.txt -Value 'SHELL'" : 'printf SHELL > shell.txt';
     await f.pool.executeShell(f.a.id, shell);
-    assert.match((await f.pool.restorePlan(f.a.id, f.a.fileChanges.at(-1)!.id, 'undo')).conflicts.join(), /归属不明/);
+    const plan = await f.pool.restorePlan(f.a.id, f.a.fileChanges.at(-1)!.id, 'undo'); assert.deepEqual(plan.conflicts, []);
+    await f.pool.applyRestore(f.a.id, plan); assert.equal(existsSync(join(f.cwd, 'shell.txt')), false);
+    assert.equal(readFileSync(join(f.cwd, 'dirty.txt'), 'utf8'), 'USER_DIRTY\r\nnew\r\n');
   } finally { await f.pool.dispose(); }
 });
 
@@ -175,8 +177,11 @@ test('TUI previews cancel without writes; panel actions and confirmed undo/redo 
     await until(() => !!terminal.input);
     const b = pool.active; const bUi = b.runtime.session.extensionRunner!.createContext().ui; bUi.setEditorText('B_UNSENT_DRAFT');
     pool.activate(a.id); const report = await tools(pool, a, [edit()]);
+    await pool.coordinator.record(cwd, a.id, 'potential side effects: powershell');
+    await pool.coordinator.record(cwd, a.id, 'finished potential side effects: powershell');
     const messages = JSON.stringify(a.runtime.session.messages); let offset = terminal.output.length; terminal.type('/undo\r');
     await until(() => stripTerminalSequences(terminal.output.slice(offset)).includes('撤销预览'));
+    assert.match(stripTerminalSequences(terminal.output.slice(offset)), /历史记录需要人工复核/);
     terminal.input?.('\x1b'); await new Promise((done) => setTimeout(done, 60));
     assert.equal(JSON.stringify(a.runtime.session.messages), messages); assert.equal(readFileSync(join(cwd, 'dirty.txt'), 'utf8'), 'USER_DIRTY\r\nnew\r\n');
     offset = terminal.output.length; terminal.type('/changes\r'); await until(() => stripTerminalSequences(terminal.output.slice(offset)).includes('撤销此文件'));

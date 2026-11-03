@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "embedding": {
+    "baseURL": "https://YOUR-EMBEDDING-ENDPOINT/v1",
+    "model": "YOUR-EMBEDDING-MODEL",
+    "apiKeyEnv": "LOCAL_PI_EMBEDDING_API_KEY",
+    "dimension": 1536
+  },
+  "automatic": {
+    "enabled": true,
+    "turnThreshold": 20,
+    "tokenThreshold": 8000,
+    "idleMinutes": 10
+  }
+}

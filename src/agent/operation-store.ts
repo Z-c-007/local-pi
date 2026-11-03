@@ -3,8 +3,10 @@ import { mkdirSync } from 'node:fs';
 import { open, readFile, link, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { FileState } from './file-changes.ts';
+import { gzipSync, gunzipSync } from 'node:zlib';
+import { within, type FileState } from './file-changes.ts';
 import { alive, canonical, overlaps, type WorkspaceCoordinator } from './workspace-coordinator.ts';
+import type { OperationFootprint, OperationSnapshot } from './operation-snapshot.ts';
 
 export interface WorkspaceOperation {
   id: string; pid: number; sessionId: string; reportId?: string; toolCallId: string; tool: string;
@@ -12,6 +14,8 @@ export interface WorkspaceOperation {
   startedAt: number; finishedAt?: number; status: 'prepared' | 'completed' | 'failed' | 'uncertain' | 'acknowledged';
   before?: FileState; after?: FileState; revision?: number; error?: string;
   result?: { isError: boolean; exitCode?: number; cancelled?: boolean };
+  footprint?: OperationFootprint;
+  invoked?: boolean;
 }
 
 /** SDK JSONL remains the conversation store. SQLite indexes host operations only. */
@@ -29,14 +33,18 @@ export class OperationStore {
         cwd TEXT NOT NULL, path TEXT, status TEXT NOT NULL, data TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS operation_session_path ON operations(session,path,n);
-      CREATE INDEX IF NOT EXISTS operation_status ON operations(status);`);
+      CREATE INDEX IF NOT EXISTS operation_status ON operations(status);
+      CREATE TABLE IF NOT EXISTS tracked_files(path TEXT PRIMARY KEY, cwd TEXT NOT NULL);
+      INSERT OR IGNORE INTO tracked_files(path,cwd)
+        SELECT path,cwd FROM operations WHERE path IS NOT NULL AND json_extract(data,'$.kind')='file';`);
     this.database = db; return db;
   }
   begin(input: Omit<WorkspaceOperation, 'id' | 'pid' | 'startedAt' | 'status'>): WorkspaceOperation {
     const operation: WorkspaceOperation = { ...input, cwd: canonical(input.cwd), path: input.path && canonical(input.path),
-      id: randomUUID(), pid: process.pid, startedAt: Date.now(), status: 'prepared' };
+      id: randomUUID(), pid: process.pid, startedAt: Date.now(), status: 'prepared', invoked: false };
     this.db().prepare('INSERT INTO operations(id,session,cwd,path,status,data) VALUES(?,?,?,?,?,?)')
       .run(operation.id, operation.sessionId, operation.cwd, operation.path ?? null, operation.status, JSON.stringify(operation));
+    if (operation.kind === 'file' && operation.path) this.track(operation.cwd, operation.path);
     return operation;
   }
   save(operation: WorkspaceOperation): void {
@@ -49,6 +57,32 @@ export class OperationStore {
     const row = this.db().prepare("SELECT data FROM operations WHERE session=? AND path=? AND status='completed' ORDER BY n DESC LIMIT 1")
       .get(sessionId, canonical(path));
     return row ? JSON.parse(row.data as string) : undefined;
+  }
+  get(id: string): WorkspaceOperation | undefined {
+    const row = this.db().prepare('SELECT data FROM operations WHERE id=?').get(id);
+    return row ? JSON.parse(row.data as string) : undefined;
+  }
+  tracked(cwd: string): string[] {
+    const root = canonical(cwd);
+    return this.db().prepare('SELECT path FROM tracked_files ORDER BY rowid DESC').all()
+      .map((row) => row.path as string).filter((path) => within(root, path));
+  }
+  track(cwd: string, path: string): void {
+    this.db().prepare('INSERT OR IGNORE INTO tracked_files(path,cwd) VALUES(?,?)').run(canonical(path), canonical(cwd));
+  }
+  async archiveSnapshot(snapshot: OperationSnapshot): Promise<string> {
+    const raw = Buffer.from(JSON.stringify(snapshot));
+    if (raw.length > 16 * 1024 * 1024) throw new Error('操作快照索引超过 16 MiB 上限');
+    const bytes = gzipSync(raw); await this.backup(bytes);
+    return createHash('sha256').update(bytes).digest('hex');
+  }
+  async loadSnapshot(hash: string): Promise<OperationSnapshot> {
+    if (!/^[a-f\d]{64}$/.test(hash)) throw new Error('操作快照索引无效');
+    const bytes = await readFile(join(this.root, 'blobs', hash));
+    if (createHash('sha256').update(bytes).digest('hex') !== hash) throw new Error('操作快照索引校验失败');
+    const snapshot = JSON.parse(gunzipSync(bytes, { maxOutputLength: 16 * 1024 * 1024 }).toString('utf8')) as OperationSnapshot;
+    if (snapshot.version !== 1 || typeof snapshot.cwd !== 'string' || !snapshot.files || !snapshot.directories || !Array.isArray(snapshot.issues)) throw new Error('操作快照格式无效');
+    return snapshot;
   }
   async backup(bytes?: Buffer): Promise<void> {
     if (!bytes) return;

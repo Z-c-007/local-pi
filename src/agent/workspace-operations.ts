@@ -6,11 +6,13 @@ import { within, type Capture, type FileState } from './file-changes.ts';
 import { canonical, WorkspaceCoordinator } from './workspace-coordinator.ts';
 import { OperationStore, type WorkspaceOperation } from './operation-store.ts';
 import { loadPiDiff, loadPiPaths } from '../tui/pi-ui.ts';
+import { takeOperationSnapshot, snapshotChanges, type OperationSnapshot } from './operation-snapshot.ts';
 
 interface Scope { cwd: string; sessionId: string; kind: 'read' | 'file' | 'workspace'; path?: string; before?: FileState; leases: string[]; revisions: number[] }
 interface Call {
   cwd: string; sessionId: string; capture?: Capture; toolName: string; toolCallId: string;
   input: Record<string, unknown>; signal?: AbortSignal; onWait(owner?: string, target?: string): void;
+  excluded?: string[];
 }
 const readonly = new Set(['read', 'grep', 'find', 'ls', 'tool_search', 'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource']);
 
@@ -42,6 +44,10 @@ export class WorkspaceOperations {
     const parent = this.scope.getStore();
     const cwd = file && !within(canonical(call.cwd), file) ? dirname(file) : canonical(call.cwd);
     let lease: string | undefined; let operation: WorkspaceOperation | undefined; let invoked = false;
+    let checkpoint: OperationSnapshot | undefined;
+    let checkpointOptions: Parameters<typeof takeOperationSnapshot>[2] | undefined;
+    let settledStatus: WorkspaceOperation['status'] | undefined;
+    const initialWrites = new Map<string, number>();
     try {
       call.signal?.throwIfAborted();
       if (parent) {
@@ -75,9 +81,26 @@ export class WorkspaceOperations {
         if (!sameState(before.state, baseline) || (before.state || baseline) && since !== undefined && await this.coordinator.later(cwd, file!, since, parent?.revisions)) {
           throw new Error(`文件版本已过期：${call.input.path}。其他会话或外部程序可能已修改；请先重新 read，再重新生成修改。`);
         }
-        operation.revision = await this.coordinator.record(cwd, call.sessionId, 'file tool attempt', [file!]);
+        operation.revision = await this.coordinator.record(cwd, call.sessionId, 'file tool attempt', [file!],
+          { operationId: operation.id, reportId: operation.reportId, phase: 'start' });
       } else if (kind === 'workspace') {
-        operation.revision = await this.coordinator.record(cwd, call.sessionId, `potential side effects: ${call.toolName}`);
+        if (call.toolName !== 'codemode') {
+          const priority = [...(call.capture?.writes.keys() ?? [])].map((path) => resolve(call.cwd, path));
+          for (const [path, writes] of call.capture?.writes ?? []) initialWrites.set(path, writes.length);
+          checkpointOptions = { priority, focus: [...new Set(priority.map(dirname))], tracked: this.store.tracked(cwd),
+            excluded: [dirname(this.store.root), ...(call.excluded ?? [])] };
+          operation.footprint = { version: 1 };
+          try {
+            checkpoint = await takeOperationSnapshot(cwd, this.store, checkpointOptions);
+            if (call.capture) (call.capture.operationIssues ??= []).push(...checkpoint.issues.map((issue) => `${call.toolName} ${operation!.id.slice(0, 8)}：${issue}`));
+            operation.footprint.before = await this.store.archiveSnapshot(checkpoint);
+          } catch (error) {
+            operation.footprint.error = String(error);
+            if (call.capture) (call.capture.operationIssues ??= []).push(`操作前快照未完成：${String(error)}`);
+          }
+        }
+        operation.revision = await this.coordinator.record(cwd, call.sessionId, `potential side effects: ${call.toolName}`, undefined,
+          { operationId: operation.id, reportId: operation.reportId, phase: 'start' });
       }
       this.store.save(operation); call.signal?.throwIfAborted();
       let expected: string | undefined;
@@ -94,6 +117,7 @@ export class WorkspaceOperations {
         leases: [...(parent?.leases ?? []), lease],
         revisions: [...(parent?.revisions ?? []), ...(kind === 'workspace' && operation.revision ? [operation.revision] : [])] };
       invoked = true;
+      operation.invoked = true; this.store.save(operation);
       const result = await this.scope.run(scope, execute);
       const outcome = result as { isError?: boolean; exitCode?: number; cancelled?: boolean; structuredContent?: { exit_code?: number } } | undefined;
       operation.result = { isError: outcome?.isError === true,
@@ -105,7 +129,9 @@ export class WorkspaceOperations {
         if (kind === 'file' && (expected === undefined || createHash('sha256').update(expected).digest('hex') !== after.state?.hash)) throw new Error('工具执行后的文件版本无法核验，已保留备份。');
         if (kind === 'read') operation.revision = await this.coordinator.sequence();
       }
-      operation.status = operation.result.isError ? 'failed' : 'completed'; operation.finishedAt = Date.now(); this.store.save(operation);
+      settledStatus = operation.result.isError ? 'failed' : 'completed';
+      operation.status = kind === 'workspace' && call.toolName !== 'codemode' ? 'prepared' : settledStatus;
+      operation.finishedAt = Date.now(); this.store.save(operation);
       if (kind === 'file' && call.capture && file && within(canonical(call.cwd), file)) {
         const path = localPath!;
         const writes = call.capture.writes.get(path) ?? [];
@@ -117,12 +143,14 @@ export class WorkspaceOperations {
       if (operation) {
         operation.error = error instanceof Error ? error.message : String(error); operation.finishedAt = Date.now();
         operation.status = 'failed';
+        settledStatus = 'failed';
         if (invoked && kind === 'file' && file) {
           try {
             operation.after = (await this.state(file)).state;
             if (!sameState(operation.before, operation.after)) operation.status = 'uncertain';
           } catch { operation.status = 'uncertain'; }
         }
+        if (invoked && kind === 'workspace' && call.toolName !== 'codemode') operation.status = 'prepared';
         this.store.save(operation);
         if (operation.status === 'uncertain') await this.coordinator.pending(operation.id, cwd, true);
       }
@@ -134,9 +162,45 @@ export class WorkspaceOperations {
         // Its completion invalidates those receipts, including same-byte writes.
         // Native codemode has no direct filesystem access; its nested tools log their own effects.
         if (invoked && kind === 'workspace' && call.toolName !== 'codemode') {
-          const revision = await this.coordinator.record(cwd, call.sessionId, `finished potential side effects: ${call.toolName}`);
-          if (operation) { operation.revision = revision; this.store.save(operation); }
+          const changes: ReturnType<typeof snapshotChanges> = [];
+          if (operation && checkpoint && checkpointOptions) {
+            try {
+              const after = await takeOperationSnapshot(cwd, this.store, { ...checkpointOptions, baseline: checkpoint });
+              if (call.capture) (call.capture.operationIssues ??= []).push(...after.issues.map((issue) => `${call.toolName} ${operation!.id.slice(0, 8)}：${issue}`));
+              operation.footprint!.after = await this.store.archiveSnapshot(after);
+              if (operation.footprint!.before && !operation.footprint!.error) changes.push(...snapshotChanges(checkpoint, after));
+            } catch (error) {
+              operation.footprint!.error = String(error);
+              if (call.capture) (call.capture.operationIssues ??= []).push(`操作后快照未完成：${String(error)}`);
+            }
+          }
+          if (operation) this.store.save(operation);
+          const revision = await this.coordinator.record(cwd, call.sessionId, `finished potential side effects: ${call.toolName}`, undefined,
+            { operationId: operation?.id, reportId: operation?.reportId, phase: 'end' });
+          if (operation) {
+            operation.revision = revision; operation.status = settledStatus ?? 'failed'; operation.finishedAt = Date.now(); this.store.save(operation);
+            for (const change of changes) {
+              this.store.track(cwd, change.path);
+              if (!call.capture || !within(canonical(call.cwd), canonical(change.path))) continue;
+              const path = [...call.capture.writes.keys(), ...Object.keys(call.capture.before.files)].find((path) => canonical(resolve(call.cwd, path)) === canonical(change.path))
+                ?? relative(call.cwd, change.path).replaceAll('\\', '/');
+              const writes = call.capture.writes.get(path) ?? [];
+              // A parent checkpoint includes its own nested tools. Replace that suffix
+              // by the outer operation's verified before/after pair, rather than double-counting.
+              writes.splice(initialWrites.get(path) ?? 0, Infinity, { before: change.before, after: change.after,
+                complete: true, revision, operationId: operation.id });
+              call.capture.writes.set(path, writes);
+            }
+          }
         }
+      } catch (error) {
+        if (operation && invoked && kind === 'workspace' && call.toolName !== 'codemode') {
+          operation.status = 'uncertain'; operation.error = `脚本已结束，但操作收尾记录未完整保存：${String(error)}`;
+          try { this.store.save(operation); }
+          finally { await this.coordinator.pending(operation.id, cwd, true); }
+          throw new Error(`${operation.error}；请使用 /recovery 核查。`);
+        }
+        throw error;
       } finally { if (lease) await this.coordinator.release(lease); }
     }
   }

@@ -31,7 +31,7 @@ export interface FileChangeReport {
   operationBased?: boolean; observedChanges?: FileChange[]; observationIssues?: string[];
 }
 export interface ToolWrite { before?: FileState; after?: FileState; complete: boolean; revision?: number; operationId?: string }
-export interface Capture { report: FileChangeReport; directory: string; before: Manifest; writes: Map<string, ToolWrite[]>; sequence?: number }
+export interface Capture { report: FileChangeReport; directory: string; before: Manifest; writes: Map<string, ToolWrite[]>; sequence?: number; operationIssues?: string[] }
 export function within(root: string, path: string): boolean {
   const part = relative(root, path); return !isAbsolute(part) && part !== '..' && !part.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`);
 }
@@ -137,9 +137,9 @@ export class FileChanges {
         report.changes.push({ path, kind: 'unavailable', before: a, after: b, note: '前后快照不完整，无法确认文件变化' });
       }
     }
-    if (report.operationBased && report.source === 'task') {
+    if (report.operationBased) {
       const observed = report.changes;
-      report.changes = []; report.observationIssues = report.issues; report.issues = [];
+      report.changes = []; report.observationIssues = [...new Set([...report.issues, ...(capture.operationIssues ?? [])])]; report.issues = [];
       report.before = { files: {}, skipped: [], issues: [] }; report.after = { files: {}, skipped: [], issues: [] };
       for (const [path, writes] of capture.writes) {
         const first = writes[0]; const last = writes.at(-1); if (!first || !last) continue;
@@ -174,6 +174,7 @@ export class FileChanges {
       report.observedChanges = observed.filter((change) => {
         const writes = capture.writes.get(change.path); if (!writes?.length) return true;
         const own = writes.at(-1)?.after; const current = after.files[change.path];
+        if (current && !current.hash || !current && !covered(after, change.path)) return false;
         return !!(own || current) && (!own?.hash || own.hash !== current?.hash || own.stamp !== current.stamp);
       });
     }
@@ -221,5 +222,5 @@ export class FileChanges {
 
 export function changeSummary(report: FileChangeReport): string {
   const known = report.changes.filter((change) => change.kind !== 'unavailable');
-  return `${known.length} 个文件 · +${known.reduce((n, c) => n + (c.added ?? 0), 0)} -${known.reduce((n, c) => n + (c.removed ?? 0), 0)}${report.issues.length ? ' · 记录不完整' : report.operationBased && report.source === 'task' ? ' · 本会话工具修改' : ' · 限定范围内的观察'}${report.observedChanges?.length ? ` · 另有 ${report.observedChanges.length} 个未归属观察` : ''}`;
+  return `${known.length} 个文件 · +${known.reduce((n, c) => n + (c.added ?? 0), 0)} -${known.reduce((n, c) => n + (c.removed ?? 0), 0)}${report.issues.length ? ' · 记录不完整' : report.operationBased && (report.source === 'task' || known.every((file) => file.attribution === 'tool')) ? ' · 本会话工具修改' : ' · 限定范围内的观察'}${report.observedChanges?.length ? ` · 另有 ${report.observedChanges.length} 个未归属观察` : ''}`;
 }

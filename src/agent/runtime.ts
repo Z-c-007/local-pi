@@ -22,6 +22,8 @@ import type { Options } from '../cli.ts';
 import { createWorkspaceExtension, type WorkspaceHooks } from '../extensions/workspace.ts';
 import { codingTools, mcpTools, restoreMode, toolsForMode } from './mode.ts';
 import { loadPiRuntimeSupport } from '../tui/pi-ui.ts';
+import { ProjectMemory } from './memory.ts';
+import { createMemoryExtension } from '../extensions/memory.ts';
 
 export { codingTools } from './mode.ts';
 
@@ -94,7 +96,7 @@ export async function createRuntime(
       agentDir,
       ...servicesOverrides,
       resourceLoaderOptions: {
-        extensionFactories: [createWorkspaceExtension(mode, hooks), ...official.builtInExtensions.map((extension) =>
+        extensionFactories: [createWorkspaceExtension(mode, hooks), (pi) => createMemoryExtension(new ProjectMemory(agentDir, cwd))(pi), ...official.builtInExtensions.map((extension) =>
           typeof extension === 'function' || extension.name !== 'mcp' ? extension : { ...extension, factory: createMcpExtension({
             loadConfig: (ctx) => official.loadMcpConfig({ agentDir, cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted() }),
             credentials: new official.McpOAuthCredentialStore(new official.FileAuthStorageBackend(join(agentDir, 'mcp-auth.json')), agentDir),

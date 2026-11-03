@@ -55,7 +55,7 @@ export function changesPanel(reports: FileChangeReport[], height: () => number, 
     cacheKey = key; cacheTheme = theme;
     let text: string;
     if (!report) text = '本会话还没有本轮文件快照。旧历史不能补造修改前的状态。\n执行模式任务或 !命令结束后会显示记录。';
-    else if (view === 'scope') text = `项目：${clean(report.cwd)}\n任务：${clean(report.title)}\n${file ? `所选文件：${clean(file.path)}\n` : ''}${report.operationBased && report.source === 'task' ? '变更页来自本会话的逐次工具记录。其他会话、脚本或外部修改只列为未归属观察，不能据此自动撤销。' : '只观察本轮起止之间的变化；期间外部编辑也可能包含。'}\n排除 ${snapshotExcludes.join('/')}、配置目录；不跟随链接。\n单文件 2 MiB、总大小 64 MiB、10000 条目。\n不记录数据库、远程操作或进程状态。\n自动恢复需完整快照和已核验的工具修改，确认前仍会检查当前版本。`;
+    else if (view === 'scope') text = `项目：${clean(report.cwd)}\n任务：${clean(report.title)}\n${file ? `所选文件：${clean(file.path)}\n` : ''}${report.operationBased && (report.source === 'task' || report.changes.some((item) => item.attribution === 'tool')) ? '变更页来自本会话的逐次工具记录，包含完整核验的脚本变更。其他会话、外部修改和无法核验的变化保留为未归属观察。' : '只观察本轮起止之间的变化；期间外部编辑也可能包含。'}\n排除 ${snapshotExcludes.join('/')}、配置目录；不跟随链接。\n单文件 2 MiB、总大小 64 MiB、10000 条目。\n不记录数据库、远程操作或进程状态。\n自动恢复需完整快照和已核验的工具修改，确认前仍会检查当前版本。`;
     else if (view === 'issues') {
       const unknown = report.changes.filter((item) => item.kind === 'unavailable');
       const issues = issuesFor(report);

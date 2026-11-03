@@ -6,7 +6,7 @@ import { within } from './file-changes.ts';
 
 export type LeaseMode = 'read' | 'write' | 'restore';
 interface Lease { id: string; pid: number; cwd: string; mode: LeaseMode; sessionId: string; paths?: string[] }
-export interface WorkspaceEvent { seq: number; cwd: string; paths?: string[]; sessionId: string; reason: string }
+export interface WorkspaceEvent { seq: number; cwd: string; paths?: string[]; sessionId: string; reason: string; operationId?: string; reportId?: string; phase?: 'start' | 'end' }
 interface State { seq: number; leases: Lease[]; tickets?: Lease[]; events: WorkspaceEvent[]; pending: Array<{ id: string; cwd: string }> }
 export const canonical = (path: string) => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path);
 export const overlaps = (a: string, b: string) => within(canonical(a), canonical(b)) || within(canonical(b), canonical(a));
@@ -127,9 +127,9 @@ export class WorkspaceCoordinator {
       throw error;
     }
   }
-  async record(cwd: string, sessionId: string, reason: string, paths?: string[]): Promise<number> {
+  async record(cwd: string, sessionId: string, reason: string, paths?: string[], metadata: Pick<WorkspaceEvent, 'operationId' | 'reportId' | 'phase'> = {}): Promise<number> {
     return this.critical((state) => {
-      const seq = ++state.seq; state.events.push({ seq, cwd: canonical(cwd), sessionId, reason, paths: paths?.map(canonical) }); return seq;
+      const seq = ++state.seq; state.events.push({ seq, cwd: canonical(cwd), sessionId, reason, paths: paths?.map(canonical), ...metadata }); return seq;
     });
   }
   async sequence(): Promise<number> { return this.critical((state) => state.seq); }
@@ -140,6 +140,10 @@ export class WorkspaceCoordinator {
   async later(cwd: string, path: string, since: number, inherited: number[] = []): Promise<boolean> {
     return this.critical((state) => state.events.some((event) => event.seq > since && !inherited.includes(event.seq)
       && (event.paths ? event.paths.includes(canonical(path)) : overlaps(cwd, event.cwd))));
+  }
+  async eventsAfter(path: string, since: number): Promise<WorkspaceEvent[]> {
+    return this.critical((state) => state.events.filter((event) => event.seq > since
+      && (event.paths ? event.paths.includes(canonical(path)) : within(canonical(event.cwd), canonical(path)))));
   }
   async pending(id: string, cwd: string, present: boolean | (() => boolean)): Promise<void> {
     await this.critical((state) => {

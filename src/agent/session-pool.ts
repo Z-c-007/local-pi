@@ -82,8 +82,8 @@ export class SessionPool extends EventEmitter {
     this.catalog = new SessionCatalog(sessionsRoot);
     this.coordinator = new WorkspaceCoordinator(this.catalog.root);
     this.fileChanges = new FileChanges(this.catalog.root, this.coordinator);
-    this.restore = new FileRestore(this.fileChanges, this.coordinator);
     this.operations = new OperationStore(this.catalog.root);
+    this.restore = new FileRestore(this.fileChanges, this.coordinator, undefined, this.operations);
     this.workspaceOperations = new WorkspaceOperations(this.operations, this.coordinator);
   }
 
@@ -547,6 +547,7 @@ export class SessionPool extends EventEmitter {
   private runTool<T>(slot: SessionSlot, event: { toolName: string; toolCallId: string; input: Record<string, unknown>; signal?: AbortSignal }, execute: () => Promise<T>): Promise<T> {
     const signals = [event.signal, slot.coordinationAbort?.signal].filter((signal): signal is AbortSignal => !!signal);
     return this.workspaceOperations.run({ ...event, cwd: slot.runtime.cwd, sessionId: slot.id, capture: slot.capture,
+      excluded: [slot.runtime.services.agentDir],
       signal: signals.length ? AbortSignal.any(signals) : undefined,
       onWait: (owner, target) => {
         slot.waitingOperations ??= new Map();

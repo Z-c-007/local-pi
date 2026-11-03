@@ -37,6 +37,7 @@ const commands = [
   ['export', '导出 HTML；附 .jsonl 路径则导出当前分支'], ['reload', '重载当前空闲会话的扩展、技能和项目说明'],
   ['mcp', '官方 MCP 服务器管理：认证、重连、启停和工具暴露'],
   ['discuss', '切换只读讨论'], ['execute', '切换执行模式'], ['project', '查看项目和模式'],
+  ['memory', '全局／项目记忆：自动提取状态、开关、立即整理、管理和本次召回'],
   ['changes', '可视化查看本轮文件变化；/changes git 查看仓库差异'], ['code-review', '审查代码变更'], ['model', '选择模型'],
   ['undo', '预览并确认撤销最近一轮文件变化'], ['redo', '预览并确认重做最近撤销的文件变化'], ['recovery', '恢复未完成操作的备份'],
   ['login', '配置模型认证'], ['name', '为当前会话命名'], ['settings', '官方完整设置菜单'],
@@ -422,7 +423,7 @@ export class MultiSessionTui {
   private async restorePreview(slot: SessionSlot, reportId: string, direction: RestoreDirection, path?: string): Promise<void> {
     const plan = await this.pool.restorePlan(slot.id, reportId, direction, path);
     const label = direction === 'undo' ? '撤销' : '重做';
-    const content = `# ${label}预览\n\n目录：${displayPath(plan.cwd)}\n\n仅恢复文件，保留聊天记录。执行前再次核对版本；先备份，出现冲突整次拒绝。\n\n${plan.files.map((file) => `- ${displayPath(file.path)}：${file.target ? file.expected ? '替换为保存的版本' : '恢复文件' : '删除本轮新增文件'}`).join('\n')}\n\n${plan.conflicts.length ? `## 无法执行\n\n${plan.conflicts.map((reason) => `- ${displayPath(reason)}`).join('\n')}` : `共 ${plan.files.length} 个文件。确认后开始${label}。`}`;
+    const content = `# ${label}预览\n\n目录：${displayPath(plan.cwd)}\n\n仅恢复文件，保留聊天记录。执行前再次核对版本；先备份，出现冲突整次拒绝。\n\n${plan.files.map((file) => `- ${displayPath(file.path)}：${file.target ? file.expected ? '替换为保存的版本' : '恢复文件' : '删除本轮新增文件'}`).join('\n')}\n\n${plan.warnings.length ? `## 历史记录需要人工复核\n\n${plan.warnings.map((warning) => `- ${displayPath(warning)}`).join('\n')}\n\n` : ''}${plan.conflicts.length ? `## 无法执行\n\n${plan.conflicts.map((reason) => `- ${displayPath(reason)}`).join('\n')}` : `共 ${plan.files.length} 个文件。确认后开始${label}。`}`;
     if (!await this.confirmFileOperation(slot, content, !plan.conflicts.length)) return;
     const journal = await this.pool.applyRestore(slot.id, plan);
     this.view(slot).transcript.resetHistory();

@@ -24,6 +24,7 @@ const write = (path: string, content: string) => ({ name: 'write', arguments: { 
 const read = (path: string) => ({ name: 'read', arguments: { path } });
 const edit = (path: string, oldText: string, newText: string) => ({ name: 'edit', arguments: { path, edits: [{ oldText, newText }] } });
 function gate() { let release!: () => void; const promise = new Promise<void>((done) => { release = done; }); return { promise, release }; }
+const shellTool = (command: string) => ({ name: process.platform === 'win32' ? 'powershell' : 'bash', arguments: { command } });
 function script(slot: SessionSlot, calls: Array<ReturnType<typeof write> | ReturnType<typeof read> | ReturnType<typeof edit> | { name: string; arguments: unknown }>, hold?: { round: number; gate: ReturnType<typeof gate>; arrived: () => void }) {
   let round = 0;
   slot.runtime.session.agent.streamFunction = (_m, _c, options) => {
@@ -247,4 +248,107 @@ test('a process killed while holding the coordination mutex is reclaimed safely 
     assert.equal(existsSync(join(root, 'workspace-coordination', 'mutex')), false);
     assert.ok(existsSync(join(root, 'workspace-coordination', 'mutex-recovery.sqlite')));
   } finally { if (child.exitCode === null) child.kill(); }
+});
+
+test('write a script, execute it and inspect it in B: A can undo and redo its script and generated file without changing B', { timeout: 30000 }, async () => {
+  const { pool, a, b, cwd } = await fixture(); writeFileSync(join(cwd, 'huge.pdf'), Buffer.alloc(2 * 1024 * 1024 + 1));
+  writeFileSync(join(cwd, 'user.txt'), 'KEEP_USER_DIRTY');
+  const body = "require('node:fs').writeFileSync(require('node:path').join(__dirname,'notes.txt'),'NOTES');";
+  try {
+    script(a, [write('slow_notes/slow_write.cjs', body), shellTool('node slow_notes/slow_write.cjs')]);
+    await pool.submit(a.id, 'Create script and run it'); const report = a.fileChanges.at(-1)!;
+    assert.deepEqual(report.changes.map((change) => change.path).sort(), ['slow_notes/notes.txt', 'slow_notes/slow_write.cjs']);
+    assert.ok(report.changes.every((change) => change.attribution === 'tool'));
+    script(b, [shellTool(process.platform === 'win32' ? 'Get-ChildItem -LiteralPath slow_notes' : 'ls slow_notes'), write('b.txt', 'B_OWN')]);
+    await pool.submit(b.id, 'Inspect only and write a different file'); b.compactionQueue.push({ text: 'B_DRAFT', mode: 'followUp' });
+    const branchB = JSON.stringify(b.runtime.session.sessionManager.getBranch());
+    const one = await pool.restorePlan(a.id, report.id, 'undo', 'slow_notes/slow_write.cjs'); assert.deepEqual(one.conflicts, []); assert.deepEqual(one.warnings, []);
+    const all = await pool.restorePlan(a.id, report.id, 'undo'); assert.deepEqual(all.conflicts, []);
+    await pool.applyRestore(a.id, all);
+    assert.equal(existsSync(join(cwd, 'slow_notes/notes.txt')), false); assert.equal(existsSync(join(cwd, 'slow_notes/slow_write.cjs')), false);
+    assert.equal(readFileSync(join(cwd, 'b.txt'), 'utf8'), 'B_OWN'); assert.equal(readFileSync(join(cwd, 'user.txt'), 'utf8'), 'KEEP_USER_DIRTY');
+    assert.equal(JSON.stringify(b.runtime.session.sessionManager.getBranch()), branchB); assert.equal(b.compactionQueue[0]?.text, 'B_DRAFT');
+    await pool.applyRestore(a.id, await pool.restorePlan(a.id, report.id, 'redo'));
+    assert.equal(readFileSync(join(cwd, 'slow_notes/notes.txt'), 'utf8'), 'NOTES'); assert.equal(readFileSync(join(cwd, 'slow_notes/slow_write.cjs'), 'utf8'), body);
+  } finally { await pool.dispose(); }
+});
+
+test('another session shell changing an A file blocks whole-task undo; an untouched selected file remains independently restorable', { timeout: 25000 }, async () => {
+  const { pool, a, b, cwd } = await fixture();
+  try {
+    script(a, [write('slow_notes/worker.cjs', "require('node:fs').writeFileSync(require('node:path').join(__dirname,'notes.txt'),'A');"), shellTool('node slow_notes/worker.cjs')]);
+    await pool.submit(a.id, 'A files'); const report = a.fileChanges.at(-1)!;
+    const command = process.platform === 'win32' ? "Set-Content -LiteralPath slow_notes/notes.txt -Value 'B_EDIT'" : "printf B_EDIT > slow_notes/notes.txt";
+    await pool.executeShell(b.id, command);
+    const all = await pool.restorePlan(a.id, report.id, 'undo'); assert.match(all.conflicts.join(), /notes.txt.*确实改变.*会话/);
+    await assert.rejects(pool.applyRestore(a.id, all), /冲突/); assert.ok(existsSync(join(cwd, 'slow_notes/worker.cjs')));
+    const one = await pool.restorePlan(a.id, report.id, 'undo', 'slow_notes/worker.cjs'); assert.deepEqual(one.conflicts, []);
+    await pool.applyRestore(a.id, one); assert.match(readFileSync(join(cwd, 'slow_notes/notes.txt'), 'utf8'), /B_EDIT/);
+  } finally { await pool.dispose(); }
+});
+
+test('a failed script still records verified additions, edits and deletions and restores exact pre-operation bytes', { timeout: 25000 }, async () => {
+  const { pool, a, cwd } = await fixture(); writeFileSync(join(cwd, 'dirty.txt'), 'USER_DIRTY\r\n'); writeFileSync(join(cwd, 'removed.txt'), 'RESTORE_ME');
+  const body = "const fs=require('node:fs');fs.writeFileSync('dirty.txt','AGENT');fs.unlinkSync('removed.txt');fs.writeFileSync('empty.txt','');process.exitCode=1;";
+  try {
+    script(a, [write('worker.cjs', body), shellTool('node worker.cjs')]); await pool.submit(a.id, 'Partial command failure');
+    const report = a.fileChanges.at(-1)!;
+    assert.deepEqual(report.changes.map((change) => change.path).sort(), ['dirty.txt', 'empty.txt', 'removed.txt', 'worker.cjs']);
+    const operation = pool.operations.list().findLast((operation) => operation.kind === 'workspace')!;
+    assert.equal(operation.status, 'failed'); assert.ok(operation.footprint?.before && operation.footprint.after);
+    const plan = await pool.restorePlan(a.id, report.id, 'undo'); assert.deepEqual(plan.conflicts, []); await pool.applyRestore(a.id, plan);
+    assert.equal(readFileSync(join(cwd, 'dirty.txt'), 'utf8'), 'USER_DIRTY\r\n'); assert.equal(readFileSync(join(cwd, 'removed.txt'), 'utf8'), 'RESTORE_ME');
+    assert.equal(existsSync(join(cwd, 'empty.txt')), false); assert.equal(existsSync(join(cwd, 'worker.cjs')), false);
+  } finally { await pool.dispose(); }
+});
+
+test('legacy shell barriers require a visible review warning and stale confirmation is refused; new unknown snapshots are not downgraded to warnings', { timeout: 20000 }, async () => {
+  const { pool, a, b, cwd } = await fixture();
+  try {
+    script(a, [write('old.txt', 'OLD')]); await pool.submit(a.id, 'Old recorded file'); const report = a.fileChanges.at(-1)!;
+    await pool.coordinator.record(cwd, a.id, 'potential side effects: powershell');
+    await pool.coordinator.record(cwd, a.id, 'finished potential side effects: powershell');
+    const plan = await pool.restorePlan(a.id, report.id, 'undo'); assert.deepEqual(plan.conflicts, []); assert.equal(plan.warnings.length, 2);
+    assert.match(plan.warnings.join(), /缺少逐文件快照.*人工确认/);
+    await pool.coordinator.record(cwd, b.id, 'potential side effects: powershell');
+    await assert.rejects(pool.applyRestore(a.id, plan), /预览已变化/); assert.equal(readFileSync(join(cwd, 'old.txt'), 'utf8'), 'OLD');
+    const fresh = await pool.restorePlan(a.id, report.id, 'undo'); const journal = await pool.applyRestore(a.id, fresh);
+    assert.equal(journal.warnings?.length, 3); assert.equal(existsSync(join(cwd, 'old.txt')), false);
+    script(a, [write('new.txt', 'NEW')]); await pool.submit(a.id, 'New file'); const latest = a.fileChanges.at(-1)!;
+    await pool.executeShell(b.id, 'echo CHECK');
+    const operation = pool.operations.list().findLast((operation) => operation.kind === 'workspace')!;
+    assert.deepEqual((await pool.restorePlan(a.id, latest.id, 'undo')).conflicts, []);
+    writeFileSync(join(pool.operations.root, 'blobs', operation.footprint!.after!), 'CORRUPT');
+    const blocked = await pool.restorePlan(a.id, latest.id, 'undo'); assert.match(blocked.conflicts.join(), /快照缺失或损坏/);
+    assert.deepEqual(blocked.warnings, []); assert.equal(readFileSync(join(cwd, 'new.txt'), 'utf8'), 'NEW');
+  } finally { await pool.dispose(); }
+});
+
+test('a later shell rewrite with identical bytes still protects B ownership through file identity and timestamps', { timeout: 20000 }, async () => {
+  const { pool, a, b, cwd } = await fixture();
+  try {
+    script(a, [write('shared.txt', 'SAME')]); await pool.submit(a.id, 'A original file'); const report = a.fileChanges.at(-1)!;
+    const body = "const fs=require('node:fs');fs.writeFileSync('shared.txt','SAME');const t=new Date(Date.now()+5000);fs.utimesSync('shared.txt',t,t);";
+    writeFileSync(join(cwd, 'rewrite.cjs'), body);
+    await pool.executeShell(b.id, 'node rewrite.cjs');
+    const plan = await pool.restorePlan(a.id, report.id, 'undo'); assert.match(plan.conflicts.join(), /确实改变.*会话/);
+    await assert.rejects(pool.applyRestore(a.id, plan), /冲突/); assert.equal(readFileSync(join(cwd, 'shared.txt'), 'utf8'), 'SAME');
+  } finally { await pool.dispose(); }
+});
+
+test('a child workspace does not invalidate a parent file outside its scope; genuinely uncovered targets stay blocked', { timeout: 20000 }, async () => {
+  const { pool, a, b, cwd } = await fixture(); const child = join(cwd, 'child'); mkdirSync(child);
+  try {
+    script(a, [write('outside-child.txt', 'A')]); await pool.submit(a.id, 'Root file'); const report = a.fileChanges.at(-1)!;
+    const nested = await pool.open({ ...pool.options, cwd: child, continue: false, session: undefined });
+    await pool.executeShell(nested.id, 'echo CHILD');
+    assert.deepEqual((await pool.restorePlan(a.id, report.id, 'undo')).conflicts, []);
+    const empty = await pool.operations.archiveSnapshot({ version: 1, cwd, files: {}, directories: {}, issues: ['扫描达到上限'] });
+    const unknown = pool.operations.begin({ sessionId: b.id, tool: 'opaque', toolCallId: 'uncovered', cwd, kind: 'workspace' });
+    unknown.status = 'completed'; unknown.invoked = true; unknown.footprint = { version: 1, before: empty, after: empty };
+    unknown.revision = await pool.coordinator.record(cwd, b.id, 'finished potential side effects: opaque', undefined, { operationId: unknown.id, phase: 'end' });
+    pool.operations.save(unknown);
+    const blocked = await pool.restorePlan(a.id, report.id, 'undo'); assert.match(blocked.conflicts.join(), /无法核验.*覆盖范围/);
+    assert.deepEqual(blocked.warnings, []); assert.equal(readFileSync(join(cwd, 'outside-child.txt'), 'utf8'), 'A');
+  } finally { await pool.dispose(); }
 });
