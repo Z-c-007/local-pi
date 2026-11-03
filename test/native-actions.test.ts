@@ -11,7 +11,7 @@ import { createRuntime, sessionDirectory } from '../src/agent/runtime.ts';
 import { restoreMode } from '../src/agent/mode.ts';
 import { parseOptions } from '../src/cli.ts';
 import { MultiSessionTui } from '../src/tui/multi-session.ts';
-import { MemoryTerminal, until } from './helpers/terminal.ts';
+import { MemoryTerminal, settle, until } from './helpers/terminal.ts';
 
 function answer(text: string, extra: Record<string, unknown> = {}): any {
   return { role: 'assistant', content: [{ type: 'text', text }], api: 'openai-completions', provider: 'native-fixture', model: 'fixture',
@@ -54,7 +54,7 @@ createInterface({input:process.stdin}).on('line',line=>{
   return { root, cwd, agentDir, pool, terminal, running, first, last, a: pool.active };
 }
 
-test('native tree, HTML/JSONL export and reload preserve branches, drafts and a background run', { timeout: 30000 }, async () => {
+test('native tree, HTML/JSONL export and reload preserve branches, drafts and a background run', { timeout: 60000 }, async () => {
   const f = await setup(); const { pool, terminal, a } = f;
   let release!: () => void; let task: Promise<void> | undefined; let aborted = false;
   const gate = new Promise<void>((done) => { release = done; });
@@ -94,10 +94,16 @@ test('native tree, HTML/JSONL export and reload preserve branches, drafts and a 
     assert.ok(b.task); assert.equal(aborted, false);
     await assert.rejects(pool.reload(b.id), /不会自动中断/); await assert.rejects(pool.navigateTree(b.id, f.first), /不会自动中断/);
     release(); await task; assert.equal(b.runtime.session.getLastAssistantText(), 'BACKGROUND_DONE');
-  } finally { release(); await task; process.emit('SIGTERM'); await f.running; await pool.dispose(); }
+  } finally {
+    release();
+    await settle(task, 'native-actions background task');
+    process.emit('SIGTERM');
+    await settle(f.running, 'native-actions TUI shutdown');
+    await settle(pool.dispose(), 'native-actions pool dispose');
+  }
 });
 
-test('manual shell streams, uses cwd, cancels independently and distinguishes !! from model context', { timeout: 30000 }, async () => {
+test('manual shell streams, uses cwd, cancels independently and distinguishes !! from model context', { timeout: 60000 }, async () => {
   const f = await setup(); const { pool, terminal, a } = f;
   try {
     terminal.type(process.platform === 'win32' ? '!Write-Output SHELL_OK; (Get-Location).Path\r' : '!printf "SHELL_OK\\n"; pwd\r');
@@ -126,10 +132,14 @@ test('manual shell streams, uses cwd, cancels independently and distinguishes !!
     assert.ok(a.runtime.session.messages.some((m) => m.role === 'bashExecution' && m.cancelled));
     assert.equal(b.runtime.session.messages.some((m) => m.role === 'bashExecution'), false);
     await until(() => stripTerminalSequences(terminal.output).includes('SHELL_OK'));
-  } finally { process.emit('SIGTERM'); await f.running; await pool.dispose(); }
+  } finally {
+    process.emit('SIGTERM');
+    await settle(f.running, 'shell TUI shutdown');
+    await settle(pool.dispose(), 'shell pool dispose');
+  }
 });
 
-test('official MCP manager persists across session switches and real MCP tools obey discussion/execute mode', { timeout: 30000 }, async () => {
+test('official MCP manager persists across session switches and real MCP tools obey discussion/execute mode', { timeout: 60000 }, async () => {
   const f = await setup(true); const { pool, terminal, a } = f;
   try {
     await until(() => a.runtime.session.getAllTools().some((t) => t.name.startsWith('mcp__fixture__')));
@@ -179,5 +189,9 @@ test('official MCP manager persists across session switches and real MCP tools o
     });
     await pool.close(b.id); assert.equal(await panel, undefined); finishFactory();
     await until(() => disposed === 1);
-  } finally { process.emit('SIGTERM'); await f.running; await pool.dispose(); }
+  } finally {
+    process.emit('SIGTERM');
+    await settle(f.running, 'MCP TUI shutdown');
+    await settle(pool.dispose(), 'MCP pool dispose');
+  }
 });

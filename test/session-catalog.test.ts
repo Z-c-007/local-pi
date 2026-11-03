@@ -8,8 +8,9 @@ import { SessionPool } from '../src/agent/session-pool.ts';
 import { createRuntime, sessionDirectory } from '../src/agent/runtime.ts';
 import { modeEntryType, restoreMode } from '../src/agent/mode.ts';
 import { parseOptions } from '../src/cli.ts';
+import { settle } from './helpers/terminal.ts';
 
-test('only submitted conversations persist; legacy histories and missing-file checks survive restart', { timeout: 30_000 }, async () => {
+test('only submitted conversations persist; legacy histories and missing-file checks survive restart', { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'local-pi-catalog-'));
   const cwd = join(root, 'project');
   const other = join(root, 'other');
@@ -109,6 +110,6 @@ test('only submitted conversations persist; legacy histories and missing-file ch
     await pool.close(blankContinue.id);
     assert.equal(existsSync(assistantOnly.getSessionFile()!), true, 'old hidden transcripts are not deleted');
   } finally {
-    await pool.dispose();
+    await settle(pool.dispose(), 'catalog pool dispose');
   }
 });

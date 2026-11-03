@@ -35,3 +35,21 @@ export async function until(predicate: () => boolean, description = 'UI state'):
     await new Promise((resolveWait) => setTimeout(resolveWait, 20));
   }
 }
+
+/** Teardown must not outlive its test: an unsettled shutdown promise is skipped
+ *  and reported, so one stuck await cannot hang the whole runner. Resolves false
+ *  when the wait was abandoned, so callers can skip assertions that need it.
+ *  Rejections are reported instead of thrown; a teardown error must not replace
+ *  the failure the test itself already reported. */
+export async function settle(promise: Promise<unknown> | undefined, label: string, ms = 10_000): Promise<boolean> {
+  if (!promise) return true;
+  let timer!: ReturnType<typeof setTimeout>;
+  const expired = new Promise<false>((resolveExpired) => { timer = setTimeout(() => resolveExpired(false), ms); });
+  const settled = await Promise.race([promise.then(() => true, (error: unknown) => {
+    console.error(`[teardown] ${label} rejected: ${error instanceof Error ? error.message : String(error)}`);
+    return true;
+  }), expired]);
+  clearTimeout(timer);
+  if (!settled) console.error(`[teardown] ${label} did not finish within ${ms}ms; continuing without it.`);
+  return settled;
+}

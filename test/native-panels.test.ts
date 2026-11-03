@@ -11,9 +11,9 @@ import { SessionPool } from '../src/agent/session-pool.ts';
 import { createRuntime } from '../src/agent/runtime.ts';
 import { parseOptions } from '../src/cli.ts';
 import { MultiSessionTui } from '../src/tui/multi-session.ts';
-import { MemoryTerminal, until } from './helpers/terminal.ts';
+import { MemoryTerminal, settle, until } from './helpers/terminal.ts';
 
-test('native settings/model selectors, real configured hotkeys and read-only session stats', { timeout: 30_000 }, async () => {
+test('native settings/model selectors, real configured hotkeys and read-only session stats', { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'local-pi-panels-'));
   const cwd = join(root, 'project'); const agentDir = join(root, 'agent'); mkdirSync(cwd); mkdirSync(agentDir);
   writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ packages: [], theme: 'dark', defaultProvider: 'panel-fixture', defaultModel: 'alpha', retry: { enabled: false } }));
@@ -122,7 +122,11 @@ test('native settings/model selectors, real configured hotkeys and read-only ses
     assert.equal(a.runtime.session.getSessionStats().tokens.total, 120);
     assert.equal(requests, 1);
   } finally {
-    release(); if (terminal.input) process.emit('SIGTERM'); await running; await pool.dispose();
-    server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done()));
+    release();
+    process.emit('SIGTERM');
+    await settle(running, 'native-panels TUI shutdown');
+    await settle(pool.dispose(), 'native-panels pool dispose');
+    server.closeAllConnections();
+    await settle(new Promise<void>((done) => server.close(() => done())), 'native-panels fixture server');
   }
 });

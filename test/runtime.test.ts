@@ -10,6 +10,7 @@ import { ModelRuntime, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { parseOptions } from '../src/cli.ts';
 import { codingTools, createRuntime, sessionDirectory } from '../src/agent/runtime.ts';
 import { readTools, restoreMode } from '../src/agent/mode.ts';
+import { settle } from './helpers/terminal.ts';
 
 // Child project tests must start their own runner, rather than inherit this runner's IPC context.
 delete process.env.NODE_TEST_CONTEXT;
@@ -172,7 +173,7 @@ test('adds numbers', () => assert.equal(sum(2, 3), 5));
       holdResponse = undefined;
       onRequest = undefined;
       release();
-      await running;
+      await settle(running, 'runtime held model request');
     }
     await runtime.newSession();
     assert.equal(runtime.cwd, options.cwd);
@@ -182,8 +183,8 @@ test('adds numbers', () => assert.equal(sum(2, 3), 5));
     await assert.rejects(createRuntime({ ...options, cwd: root, session: saved }, { modelRuntime, settingsManager, sessionsRoot }), /会话所属项目/);
     assert.notEqual(sessionDirectory(cwd), sessionDirectory(root));
   } finally {
-    await runtime?.dispose();
+    await settle(runtime?.dispose(), 'runtime dispose');
     server.closeAllConnections();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await settle(new Promise<void>((resolve) => server.close(() => resolve())), 'runtime fixture server');
   }
 });

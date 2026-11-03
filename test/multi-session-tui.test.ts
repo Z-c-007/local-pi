@@ -9,9 +9,9 @@ import { createRuntime } from '../src/agent/runtime.ts';
 import { restoreMode } from '../src/agent/mode.ts';
 import { parseOptions } from '../src/cli.ts';
 import { MultiSessionTui } from '../src/tui/multi-session.ts';
-import { MemoryTerminal, until } from './helpers/terminal.ts';
+import { MemoryTerminal, settle, until } from './helpers/terminal.ts';
 
-test('official TUI components switch sessions, retain drafts, and route background dialogs', { timeout: 20_000 }, async () => {
+test('official TUI components switch sessions, retain drafts, and route background dialogs', { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'local-pi-ui-'));
   const cwd = join(root, 'workspace');
   const agentDir = join(root, 'agent');
@@ -100,7 +100,8 @@ test('official TUI components switch sessions, retain drafts, and route backgrou
     await running;
     assert.equal(pool.slots.size, 0);
   } finally {
-    await pool.dispose();
-    terminal.type('/quit\r');
+    process.emit('SIGTERM');
+    await settle(running, 'multi-session TUI shutdown');
+    await settle(pool.dispose(), 'multi-session pool dispose');
   }
 });

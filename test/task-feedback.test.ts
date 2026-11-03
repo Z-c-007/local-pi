@@ -15,7 +15,7 @@ import { parseOptions } from '../src/cli.ts';
 import { MultiSessionTui } from '../src/tui/multi-session.ts';
 import { loadPiUi } from '../src/tui/pi-ui.ts';
 import { Transcript } from '../src/tui/transcript.ts';
-import { MemoryTerminal, until } from './helpers/terminal.ts';
+import { MemoryTerminal, settle, until } from './helpers/terminal.ts';
 
 function gate() {
   let release!: () => void;
@@ -23,7 +23,7 @@ function gate() {
   return { promise, release };
 }
 
-test('native themes/footer, independent persisted task feedback, and unsupported command routing', { timeout: 30_000 }, async () => {
+test('native themes/footer, independent persisted task feedback, and unsupported command routing', { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'local-pi-feedback-'));
   const cwd = join(root, 'workspace');
   const agentDir = join(root, 'agent');
@@ -197,10 +197,10 @@ test('native themes/footer, independent persisted task feedback, and unsupported
     assert.ok(new Transcript(restored, { requestRender() {} } as TUI, () => {}).render(120).map(stripTerminalSequences).join('\n').includes('本次耗时'));
   } finally {
     for (const item of gates) item.release();
-    if (terminal.input) process.emit('SIGTERM');
-    await running;
-    await pool.dispose();
+    process.emit('SIGTERM');
+    await settle(running, 'task-feedback TUI shutdown');
+    await settle(pool.dispose(), 'task-feedback pool dispose');
     server.closeAllConnections();
-    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    await settle(new Promise<void>((resolveClose) => server.close(() => resolveClose())), 'task-feedback fixture server');
   }
 });

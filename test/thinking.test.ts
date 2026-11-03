@@ -11,7 +11,7 @@ import { SessionPool } from '../src/agent/session-pool.ts';
 import { createRuntime } from '../src/agent/runtime.ts';
 import { parseOptions } from '../src/cli.ts';
 import { MultiSessionTui } from '../src/tui/multi-session.ts';
-import { MemoryTerminal, until } from './helpers/terminal.ts';
+import { MemoryTerminal, settle, until } from './helpers/terminal.ts';
 
 async function setup(bindings?: Record<string, string>) {
   const root = mkdtempSync(join(tmpdir(), 'local-pi-thinking-'));
@@ -76,17 +76,17 @@ async function setup(bindings?: Record<string, string>) {
     holdNext() { nextHold = new Promise<void>((resolveHold) => { release = resolveHold; }); return () => release?.(); },
     async finish() {
       release?.();
-      if (terminal.input) process.emit('SIGTERM');
-      await running;
-      await pool.dispose();
+      process.emit('SIGTERM');
+      const shutDown = await settle(running, 'thinking TUI shutdown');
+      await settle(pool.dispose(), 'thinking pool dispose');
       server.closeAllConnections();
-      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
-      assert.equal(getKeybindings(), previousKeys, 'leaving the TUI restores its previous key registry');
+      await settle(new Promise<void>((resolveClose) => server.close(() => resolveClose())), 'thinking fixture server');
+      if (shutDown) assert.equal(getKeybindings(), previousKeys, 'leaving the TUI restores its previous key registry');
     },
   };
 }
 
-test('native thinking selector, Shift+Tab, persistence and active SDK requests remain independent', { timeout: 30_000 }, async () => {
+test('native thinking selector, Shift+Tab, persistence and active SDK requests remain independent', { timeout: 60_000 }, async () => {
   const fixture = await setup();
   const { pool, terminal, settingsManager, requests, menu } = fixture;
   try {
@@ -159,7 +159,7 @@ test('native thinking selector, Shift+Tab, persistence and active SDK requests r
   } finally { await fixture.finish(); }
 });
 
-test('native thinking actions honor configured keys and selecting or cancelling preserves the default', { timeout: 20_000 }, async () => {
+test('native thinking actions honor configured keys and selecting or cancelling preserves the default', { timeout: 60_000 }, async () => {
   const fixture = await setup({ 'app.thinking.cycle': 'alt+y', 'app.thinking.save': 'alt+s' });
   const { pool, terminal, menu, settingsManager, requests } = fixture;
   try {

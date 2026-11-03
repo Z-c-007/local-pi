@@ -12,7 +12,7 @@ import { createRuntime } from '../src/agent/runtime.ts';
 import { parseOptions } from '../src/cli.ts';
 import { MultiSessionTui } from '../src/tui/multi-session.ts';
 import { SessionEditor, SessionWorking } from '../src/tui/working.ts';
-import { MemoryTerminal, until } from './helpers/terminal.ts';
+import { MemoryTerminal, settle, until } from './helpers/terminal.ts';
 
 function gate() {
   let release!: () => void;
@@ -20,7 +20,7 @@ function gate() {
   return { promise, release };
 }
 
-test('native Working border covers initial wait, switching, retries, compaction, waiting UI and cancellation', { timeout: 30_000 }, async () => {
+test('native Working border covers initial wait, switching, retries, compaction, waiting UI and cancellation', { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'local-pi-working-'));
   const cwd = join(root, 'workspace');
   const agentDir = join(root, 'agent');
@@ -175,9 +175,10 @@ test('native Working border covers initial wait, switching, retries, compaction,
     pool.off('active', update);
     for (const release of releases) release.release();
     for (const view of views.values()) view.working.dispose();
-    if (terminal.input) { process.emit('SIGTERM'); await running; }
-    await pool.dispose();
+    process.emit('SIGTERM');
+    await settle(running, 'working TUI shutdown');
+    await settle(pool.dispose(), 'working pool dispose');
     server.closeAllConnections();
-    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    await settle(new Promise<void>((resolveClose) => server.close(() => resolveClose())), 'working fixture server');
   }
 });

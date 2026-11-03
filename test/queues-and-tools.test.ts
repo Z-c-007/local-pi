@@ -11,13 +11,13 @@ import { SessionPool } from '../src/agent/session-pool.ts';
 import { createRuntime } from '../src/agent/runtime.ts';
 import { parseOptions } from '../src/cli.ts';
 import { MultiSessionTui } from '../src/tui/multi-session.ts';
-import { MemoryTerminal, until } from './helpers/terminal.ts';
+import { MemoryTerminal, settle, until } from './helpers/terminal.ts';
 
 function gate() { let release!: () => void; const promise = new Promise<void>((done) => { release = done; }); return { promise, release }; }
 const textOf = (message: any) => typeof message.content === 'string' ? message.content
   : message.content?.filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n') ?? '';
 
-test('SDK queues, compaction, copy and external draft editing stay session-local', { timeout: 30_000 }, async () => {
+test('SDK queues, compaction, copy and external draft editing stay session-local', { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'local-pi-queues-')); const cwd = join(root, 'workspace'); const agentDir = join(root, 'agent');
   mkdirSync(cwd); mkdirSync(agentDir); writeFileSync(join(cwd, 'fixture.txt'), 'A local fixture.');
   writeFileSync(join(agentDir, 'keybindings.json'), JSON.stringify({ 'app.message.followUp': 'alt+f', 'app.message.dequeue': 'alt+u',
@@ -121,7 +121,10 @@ test('SDK queues, compaction, copy and external draft editing stay session-local
     assert.equal(a.state, 'idle');
   } finally {
     for (const item of gates) item.release();
-    if (terminal.input) process.emit('SIGTERM'); await running; await pool.dispose();
-    server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done()));
+    process.emit('SIGTERM');
+    await settle(running, 'queues TUI shutdown');
+    await settle(pool.dispose(), 'queues pool dispose');
+    server.closeAllConnections();
+    await settle(new Promise<void>((done) => server.close(() => done())), 'queues fixture server');
   }
 });

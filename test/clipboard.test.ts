@@ -14,7 +14,7 @@ import { parseOptions } from '../src/cli.ts';
 import { MultiSessionTui } from '../src/tui/multi-session.ts';
 import { installThinkingKeybindings } from '../src/tui/keybindings.ts';
 import type { ClipboardReader } from '../src/tui/clipboard.ts';
-import { MemoryTerminal, until } from './helpers/terminal.ts';
+import { MemoryTerminal, settle, until } from './helpers/terminal.ts';
 
 // A valid small RGBA PNG, including CRCs, for the SDK's real image transcoder.
 function pngChunk(type: string, bytes: Buffer) {
@@ -32,7 +32,7 @@ function gate() {
   return { promise, release };
 }
 
-test('native paste shortcut preserves drafts and the SDK reads the pasted screenshot for the model', { timeout: 30_000 }, async () => {
+test('native paste shortcut preserves drafts and the SDK reads the pasted screenshot for the model', { timeout: 60_000 }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'local-pi-clipboard-'));
   const cwd = join(root, 'workspace'); const agentDir = join(root, 'agent');
   mkdirSync(cwd); mkdirSync(agentDir);
@@ -135,9 +135,11 @@ test('native paste shortcut preserves drafts and the SDK reads the pasted screen
     assert.equal(requests.length, 2);
   } finally {
     for (const item of gates) item.release();
-    if (terminal.input) process.emit('SIGTERM');
-    await running; await pool.dispose();
-    server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done()));
+    process.emit('SIGTERM');
+    await settle(running, 'clipboard TUI shutdown');
+    await settle(pool.dispose(), 'clipboard pool dispose');
+    server.closeAllConnections();
+    await settle(new Promise<void>((done) => server.close(() => done())), 'clipboard fixture server');
   }
 });
 

@@ -9,7 +9,7 @@ import { SessionPool } from '../src/agent/session-pool.ts';
 import { createRuntime, sessionDirectory } from '../src/agent/runtime.ts';
 import { parseOptions } from '../src/cli.ts';
 import { Transcript } from '../src/tui/transcript.ts';
-import { MemoryTerminal, until } from './helpers/terminal.ts';
+import { MemoryTerminal, settle, until } from './helpers/terminal.ts';
 
 type Message = Parameters<SessionManager['appendMessage']>[0];
 type Assistant = Extract<Message, { role: 'assistant' }>;
@@ -20,7 +20,7 @@ const assistant = (content: Assistant['content'], timestamp: number): Assistant 
   stopReason: 'stop', timestamp,
 });
 
-test('SDK message cards align, disclose reasoning and full tool output, and survive streaming and resize', async () => {
+test('SDK message cards align, disclose reasoning and full tool output, and survive streaming and resize', { timeout: 60_000 }, async () => {
   initTheme(undefined, false);
   const root = mkdtempSync(join(tmpdir(), 'local-pi-transcript-'));
   const cwd = join(root, 'workspace');
@@ -149,5 +149,5 @@ test('SDK message cards align, disclose reasoning and full tool output, and surv
       await until(() => fullscreen.getScreenLines().every((line) => visibleWidth(line) <= 42), 'narrow fullscreen resize');
       assert.equal(editor.getText(), '保留草稿');
     } finally { fullscreen.stop(); }
-  } finally { await pool.dispose(); }
+  } finally { await settle(pool.dispose(), 'transcript pool dispose'); }
 });

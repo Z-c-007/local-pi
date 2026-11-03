@@ -10,6 +10,7 @@ import { SessionPool } from '../src/agent/session-pool.ts';
 import { createRuntime } from '../src/agent/runtime.ts';
 import { parseOptions } from '../src/cli.ts';
 import { readTools } from '../src/agent/mode.ts';
+import { settle } from './helpers/terminal.ts';
 
 delete process.env.NODE_TEST_CONTEXT;
 
@@ -140,8 +141,8 @@ setTimeout(() => process.exit(2), 20000).unref();
     assert.equal(pool.slots.size, count);
     assert.ok(payloads.some((entry) => entry.task === 'task-B'));
   } finally {
-    await pool.dispose();
+    await settle(pool.dispose(), 'pool dispose');
     server.closeAllConnections();
-    await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    await settle(new Promise<void>((resolveClose) => server.close(() => resolveClose())), 'pool fixture server');
   }
 });

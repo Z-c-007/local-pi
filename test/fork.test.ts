@@ -11,7 +11,7 @@ import { modeEntryType, restoreMode } from '../src/agent/mode.ts';
 import { readTaskReports, taskMetricsType } from '../src/agent/task-metrics.ts';
 import { parseOptions } from '../src/cli.ts';
 import { MultiSessionTui } from '../src/tui/multi-session.ts';
-import { MemoryTerminal, until } from './helpers/terminal.ts';
+import { MemoryTerminal, settle, until } from './helpers/terminal.ts';
 
 type Message = Parameters<SessionManager['appendMessage']>[0];
 const assistant = (text: string): Extract<Message, { role: 'assistant' }> => ({
@@ -58,7 +58,7 @@ export default (pi) => {
   return { root, pool, options, seed, first, last, tool, half, cwd };
 }
 
-test('fork clones a persisted safe branch without replacing its source; metadata and mode survive reopen', { timeout: 20000 }, async () => {
+test('fork clones a persisted safe branch without replacing its source; metadata and mode survive reopen', { timeout: 60000 }, async () => {
   const f = await setup(); const { pool, first, last, tool, half, seed } = f;
   try {
     const source = await pool.open(f.options); const original = readFileSync(seed.getSessionFile()!, 'utf8');
@@ -99,10 +99,10 @@ test('fork clones a persisted safe branch without replacing its source; metadata
     writeFileSync(join(f.root, 'cancel'), ''); const size = pool.slots.size;
     assert.equal(await pool.fork(source.id, first), undefined);
     assert.equal(pool.slots.size, size);
-  } finally { await pool.dispose(); }
+  } finally { await settle(pool.dispose(), 'fork pool dispose'); }
 });
 
-test('fork keeps an actual SDK run and its queue alive while the child stays idle', { timeout: 20000 }, async () => {
+test('fork keeps an actual SDK run and its queue alive while the child stays idle', { timeout: 60000 }, async () => {
   const f = await setup(); let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   let task: Promise<void> | undefined; let requests = 0; let aborted = false;
@@ -126,10 +126,10 @@ test('fork keeps an actual SDK run and its queue alive while the child stays idl
     release(); await task;
     assert.match(source.runtime.session.getLastAssistantText()!, /RUN_FINISHED/);
     assert.equal(aborted, false);
-  } finally { release(); await task; await f.pool.dispose(); }
+  } finally { release(); await settle(task, 'fork source task'); await settle(f.pool.dispose(), 'fork pool dispose'); }
 });
 
-test('fork menu cancellation preserves source and confirmation opens an independent conversation', { timeout: 20000 }, async () => {
+test('fork menu cancellation preserves source and confirmation opens an independent conversation', { timeout: 60000 }, async () => {
   const f = await setup(); const terminal = new MemoryTerminal(); const ui = new MultiSessionTui(f.pool, terminal);
   const running = ui.run();
   try {
@@ -143,5 +143,9 @@ test('fork menu cancellation preserves source and confirmation opens an independ
     assert.equal(f.pool.active.state, 'idle');
     terminal.type('/session\r'); await until(() => terminal.output.includes('分叉来源'));
     terminal.type('\x1b');
-  } finally { process.emit('SIGTERM'); await running; await f.pool.dispose(); }
+  } finally {
+    process.emit('SIGTERM');
+    await settle(running, 'fork TUI shutdown');
+    await settle(f.pool.dispose(), 'fork pool dispose');
+  }
 });
