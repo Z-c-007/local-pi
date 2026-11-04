@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { WorkspaceCoordinator } from './workspace-coordinator.ts';
 import { DatabaseSync } from 'node:sqlite';
+import { ollamaEmbedder, ollamaQueryInstruction } from './ollama-embedding.ts';
+import { markdownBackend } from './markdown-memory.ts';
 
 export type MemoryScope = 'global' | 'project';
 export interface MemoryRecord { id: string; memory: string; metadata?: Record<string, unknown>; score?: number }
@@ -15,10 +17,12 @@ export interface MemoryBackend {
   delete(id: string): Promise<unknown>;
   update?(id: string, options: { text: string; metadata: Record<string, unknown> }): Promise<unknown>;
   close?(): Promise<void>;
+  reindex?(): Promise<void>;
 }
 export interface MemoryConfig {
   enabled: boolean;
-  embedding: { baseURL: string; model: string; apiKeyEnv: string; dimension: number };
+  embedding: { baseURL: string; model: string; apiKeyEnv: string; dimension: number;
+    provider?: 'openai' | 'ollama'; timeoutMs?: number; queryInstruction?: string };
   automatic?: { enabled?: boolean; turnThreshold?: number; tokenThreshold?: number; idleMinutes?: number; model?: string };
 }
 export interface MemoryChange { kind: 'add' | 'replace' | 'forget'; scope: MemoryScope; text?: string; targetId?: string; expectedText?: string }
@@ -26,7 +30,7 @@ export type MemoryBackendFactory = (directory: string, config: MemoryConfig) => 
 
 /** The SDK is optional at startup: no configuration means no imports, files, or network calls. */
 export async function mem0Backend(directory: string, config: MemoryConfig): Promise<MemoryBackend> {
-  const apiKey = process.env[config.embedding.apiKeyEnv];
+  const apiKey = config.embedding.provider === 'ollama' ? 'ollama' : process.env[config.embedding.apiKeyEnv];
   if (!apiKey) throw new Error(`请设置环境变量 ${config.embedding.apiKeyEnv}，然后重新启动 local-pi。`);
   process.env.MEM0_TELEMETRY = 'false';
   const { Memory } = await import('mem0ai/oss');
@@ -43,10 +47,10 @@ export async function mem0Backend(directory: string, config: MemoryConfig): Prom
   // Keep this version-bound adaptation here; the real-SDK integration test covers it.
   const embedder = (engine as unknown as { embedder: {
     openai: { timeout: number; maxRetries: number };
-    embed(text: string): Promise<number[]>;
-    embedBatch(texts: string[]): Promise<number[][]>;
+    embed(text: string, action?: string): Promise<number[]>;
+    embedBatch(texts: string[], action?: string): Promise<number[][]>;
   } }).embedder;
-  embedder.openai.timeout = 4000;
+  embedder.openai.timeout = config.embedding.timeoutMs ?? 4000;
   embedder.openai.maxRetries = 0;
   const validate = (vector: number[]) => {
     if (!Array.isArray(vector) || vector.length !== config.embedding.dimension || !vector.every(Number.isFinite)) {
@@ -54,9 +58,13 @@ export async function mem0Backend(directory: string, config: MemoryConfig): Prom
     }
     return vector;
   };
-  const embed = embedder.embed.bind(embedder); const batch = embedder.embedBatch.bind(embedder);
-  embedder.embed = async (text) => validate(await embed(text));
-  embedder.embedBatch = async (texts) => (await batch(texts)).map(validate);
+  const native = config.embedding.provider === 'ollama'
+    ? ollamaEmbedder(config.embedding, basename(dirname(directory)) === 'projects'
+      ? dirname(dirname(directory)) : dirname(directory)) : undefined;
+  const embed = native ? native.embed : embedder.embed.bind(embedder);
+  const batch = native ? native.embedBatch : embedder.embedBatch.bind(embedder);
+  embedder.embed = async (text, action) => validate(await embed(text, action));
+  embedder.embedBatch = async (texts, action) => (await batch(texts, action)).map(validate);
   return Object.assign(engine, { async close() {
     // Mem0 3.3.1 has no public Memory.close(); release its two SQLite handles on reload/close.
     const native = engine as unknown as { _initPromise: Promise<void>; vectorStore?: { db?: { close(): void } }; db: { close(): void } };
@@ -78,11 +86,11 @@ export function memoryProjectRoot(cwd: string): string {
 }
 
 const clean = (text: string) => text.replace(/[\x00-\x08\x0b-\x1f\x7f\x1b]/g, '');
-export function memoryContext(records: Array<MemoryRecord & { scope: MemoryScope }>): string {
+export function memoryContext(records: Array<MemoryRecord & { scope: MemoryScope }>, compact = false): string {
   if (!records.length) return '';
   const selected: Array<Record<string, unknown>> = [];
-  for (const record of records.slice(0, 6)) {
-    const item = { scope: record.scope, id: clean(record.id).slice(0, 128), text: clean(record.memory).slice(0, 800) };
+  for (const record of records.slice(0, compact ? 12 : 6)) {
+    const item = { scope: record.scope, id: clean(record.id).slice(0, 128), text: clean(record.memory).slice(0, compact ? 4000 : 800) };
     if (JSON.stringify([...selected, item]).length > 6000) break;
     selected.push(item);
   }
@@ -122,6 +130,9 @@ export class ProjectMemory {
     if (!e || typeof e.baseURL !== 'string' || typeof e.model !== 'string' || !e.model.trim()
       || typeof e.apiKeyEnv !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(e.apiKeyEnv)
       || !Number.isInteger(e.dimension) || e.dimension < 1 || e.dimension > 65536) throw new Error('请配置 Embedding 的 baseURL、model、apiKeyEnv、dimension。');
+    if (e.provider !== undefined && !['openai', 'ollama'].includes(e.provider)) throw new Error('Embedding provider 只能是 openai 或 ollama。');
+    if (e.timeoutMs !== undefined && (!Number.isInteger(e.timeoutMs) || e.timeoutMs < 100 || e.timeoutMs > 120_000)) throw new Error('Embedding timeoutMs 必须为 100–120000 毫秒。');
+    if (e.queryInstruction !== undefined && (typeof e.queryInstruction !== 'string' || e.queryInstruction.length > 1000)) throw new Error('Embedding queryInstruction 必须为不超过 1000 字符的文本。');
     let url: URL;
     try { url = new URL(e.baseURL); } catch { throw new Error('Embedding baseURL 无效。'); }
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('Embedding baseURL 必须是 HTTP(S) 地址，不得包含凭证或查询参数。');
@@ -131,6 +142,7 @@ export class ProjectMemory {
     if (scope !== 'global' && scope !== 'project') throw new Error('范围只能是 global 或 project。');
     return scope === 'global' ? join(this.root, 'global') : join(this.root, 'projects', this.projectKey);
   }
+  markdownPath(scope: MemoryScope): string { return join(this.directory(scope), 'MEMORY.md'); }
   forProject(cwd: string): ProjectMemory { return new ProjectMemory(dirname(this.configPath), cwd, this.factory); }
   private async run<T>(scope: MemoryScope, fn: (backend: MemoryBackend) => Promise<T>, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted();
@@ -147,7 +159,8 @@ export class ProjectMemory {
       const lease = await coordinator.wait(directory, 'write', 'local-pi-memory', { signal });
       try {
         const { baseURL, model, dimension } = config.embedding;
-        const fingerprint = JSON.stringify({ baseURL, model, dimension });
+        const fingerprint = JSON.stringify({ baseURL, model, dimension, ...(config.embedding.provider === 'ollama'
+          ? { provider: 'ollama', queryInstruction: ollamaQueryInstruction(config.embedding) } : {}) });
         const manifest = join(directory, 'embedding.json');
         let previous: string | undefined;
         try { previous = await readFile(manifest, 'utf8'); }
@@ -163,7 +176,7 @@ export class ProjectMemory {
         let backend: MemoryBackend;
         try { backend = await client; } catch (error) { this.clients.delete(key); throw error; }
         signal?.throwIfAborted();
-        return await fn(backend);
+        return await fn(await markdownBackend(directory, backend));
       } finally { await coordinator.release(lease); }
     });
     this.tail = operation;
@@ -174,6 +187,9 @@ export class ProjectMemory {
   }
   list(scope: MemoryScope): Promise<MemoryRecord[]> {
     return this.run(scope, async (client) => (await client.getAll({ filters: { user_id: 'local-pi' }, topK: 100 })).results);
+  }
+  reindex(scope: MemoryScope): Promise<void> {
+    return this.run(scope, async (client) => { if (!client.reindex) throw new Error('当前后端无法重建索引。'); await client.reindex(); });
   }
   async search(scope: MemoryScope, query: string): Promise<MemoryRecord[]> {
     if (!query.trim() || query.length > 4000) throw new Error('搜索内容必须为 1–4000 个字符。');
@@ -240,6 +256,14 @@ export class ProjectMemory {
   async recall(query: string): Promise<string> {
     this.lastRecall = [];
     if (!await this.config()) return '';
+    // Always reread the authoritative files: a hand edit or another session's
+    // write is visible next turn. Tiny stores need no embedding/model startup.
+    const compact = (await Promise.all((['global', 'project'] as const).map(async (scope) =>
+      (await this.list(scope)).map((record) => ({ ...record, scope }))))).flat();
+    if (compact.length <= 12 && JSON.stringify(compact.map(({ id, memory, scope }) => ({ id, text: memory, scope }))).length <= 5000) {
+      this.lastRecall = compact;
+      return memoryContext(compact, true);
+    }
     const records = await Promise.all((['global', 'project'] as const).map(async (scope) =>
       (await this.search(scope, query.slice(0, 4000))).map((record) => ({ ...record, scope }))));
     this.lastRecall = records.flat();

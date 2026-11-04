@@ -4,6 +4,7 @@ import { infoPanel } from '../tui/info-panel.ts';
 import { panelFrame } from '../tui/panel-frame.ts';
 import { AutomaticMemory, type MemorySnapshot } from '../agent/automatic-memory.ts';
 import { piMemoryExtractor } from '../agent/memory-extractor.ts';
+import { MemoryFileError } from '../agent/markdown-memory.ts';
 
 const help = `/memory status 查看配置与存储位置
 /memory list [project|global] 查看记忆（最多 100 条）
@@ -14,6 +15,7 @@ const help = `/memory status 查看配置与存储位置
 /memory delete project|global ID 预览并确认删除
 /memory edit project|global ID 内容 预览并确认修改
 /memory used 查看本会话最近一轮召回
+/memory reindex project|global 从 MD 重建检索索引
 /memory auto on|off 开启／暂停当前项目自动提取
 /memory extract 立即检查当前项目的待处理内容并加入后台
 /memory retry 重试当前项目的失败批次
@@ -77,7 +79,7 @@ export function createMemoryExtension(memory: ProjectMemory): ExtensionFactory {
           if (!action) { await show(ctx, '记忆 · 使用帮助', help); return; }
           if (action === 'status') {
             const enabled = !!await memory.config();
-            await show(ctx, '记忆 · 状态', `状态：${enabled ? '已配置（未进行联网验证）' : '未启用'}\n\n配置：${memory.configPath}\n\n项目根目录：${memory.projectRoot}\n\n全局库：${memory.directory('global')}\n\n项目库：${memory.directory('project')}\n\n${await automatic.status()}`);
+            await show(ctx, '记忆 · 状态', `状态：${enabled ? '已配置（MD 为正文，数据库为检索索引）' : '未启用'}\n\n配置：${memory.configPath}\n\n项目根目录：${memory.projectRoot}\n\n全局记忆文件：${memory.markdownPath('global')}\n\n项目记忆文件：${memory.markdownPath('project')}\n\n${await automatic.status()}`);
             return;
           }
           if (action === 'used') { await show(ctx, '记忆 · 最近一轮召回', formatMemories(memory.lastRecall)); return; }
@@ -98,12 +100,13 @@ export function createMemoryExtension(memory: ProjectMemory): ExtensionFactory {
           const scope = scopeOf(rawScope ?? (action === 'list' ? 'project' : undefined));
           const label = scope === 'global' ? '全局' : '当前项目';
           if (action === 'list') { await show(ctx, `记忆 · ${label}`, formatMemories(await memory.list(scope))); return; }
+          if (action === 'reindex') { await memory.reindex(scope); ctx.ui.notify(`${label}记忆索引已从 MD 重建。`, 'info'); return; }
           if (action === 'search') { await show(ctx, `记忆 · ${label}搜索`, formatMemories(await memory.search(scope, rest.join(' ')))); return; }
           if (action === 'add') {
             const content = rest.join(' ');
             if (scope === 'global' && (!ctx.hasUI || !await ctx.ui.confirm('保存为全局记忆', `所有项目都可召回：\n${content}`))) return;
             await memory.add(scope, content, ctx.sessionManager.getSessionId());
-            ctx.ui.notify(`已保存${label}记忆；下一次提问时按相关性召回。`, 'info'); return;
+            ctx.ui.notify(`已保存${label}记忆：${memory.markdownPath(scope)}；下一次提问会读取，内容较多时按相关性召回。`, 'info'); return;
           }
           if (action === 'edit') {
             const [id, ...words] = rest; const text = words.join(' ');
@@ -124,9 +127,9 @@ export function createMemoryExtension(memory: ProjectMemory): ExtensionFactory {
             ctx.ui.notify('记忆已删除。', 'info'); return;
           }
           throw new Error('未知记忆命令。输入 /memory 查看帮助。');
-        } catch {
+        } catch (error) {
           // Provider exceptions can contain request headers or credentials. Never echo them to the TUI.
-          ctx.ui.notify(`记忆操作未完成。请检查命令、${memory.configPath}、Embedding 凭证和网络；项目文件未修改。`, 'error');
+          ctx.ui.notify(error instanceof MemoryFileError ? error.message : `记忆操作未完成。请检查命令、${memory.configPath}、MD 文件格式、Embedding 和网络；记忆文件位置见 /memory status。`, 'error');
         }
       },
     });
@@ -136,6 +139,7 @@ export function createMemoryExtension(memory: ProjectMemory): ExtensionFactory {
       memory.lastRecall = [];
       if (event.messageType !== 'user' || !event.prompt?.trim()) return;
       await safely(() => automatic.capture(snapshot(ctx), 'busy'));
+      if (await memory.config().catch(() => undefined)) ctx.ui.setStatus('local-pi-memory', '记忆：等待向量模型／检索中…');
       try {
         const content = await memory.recall(event.prompt);
         event.systemPromptOptions.sections.local_pi_memory = content;

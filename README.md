@@ -6,7 +6,7 @@
 
 需要 Node.js 22.19+、npm。Git 用于查看代码变更。
 
-记忆功能已接入 Mem0：全局／项目共享记忆，按会话增量批量自动提取，复用 Pi 模型认证，支持后台恢复、修改与删除及每轮召回。默认未启用；仍需单独配置 Embedding。使用 `/memory` 查看帮助，配置和边界见 [记忆使用说明](docs/memory.md)。
+记忆以全局／项目各一份 `MEMORY.md` 保存正文，Mem0 + SQLite 建立检索索引。按会话增量批量自动提取，复用 Pi 模型认证；支持手动编辑同步、短记忆直接读取、长记忆检索及索引重建。需要配置 Embedding，可用本地 Ollama。使用 `/memory` 查看帮助，配置和边界见 [记忆使用说明](docs/memory.md)。
 
 ```powershell
 cd D:\learn\Pi

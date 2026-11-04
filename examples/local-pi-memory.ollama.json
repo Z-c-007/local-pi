@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "embedding": {
+    "provider": "ollama",
+    "baseURL": "http://127.0.0.1:11434/v1",
+    "model": "qwen3-embedding:0.6b",
+    "apiKeyEnv": "LOCAL_PI_EMBEDDING_API_KEY",
+    "dimension": 1024,
+    "timeoutMs": 60000
+  },
+  "automatic": {
+    "enabled": true,
+    "turnThreshold": 20,
+    "tokenThreshold": 8000,
+    "idleMinutes": 10
+  }
+}
